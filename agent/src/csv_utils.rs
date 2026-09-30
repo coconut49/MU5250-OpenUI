@@ -24,7 +24,9 @@ pub fn csv_escape(s: &str) -> String {
     }
 }
 
-pub fn chrono_lite(epoch: u64) -> String {
+/// `YYYY-MM-DDTHH:MM:SS` for a device-clock epoch. No `Z`: the firmware keeps
+/// local time in the system clock (TZ is "UTC"), so this is device-local time.
+pub fn device_datetime(epoch: u64) -> String {
     let secs = epoch as i64;
     let days = secs / 86400;
     let time = secs % 86400;
@@ -41,5 +43,16 @@ pub fn chrono_lite(epoch: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let yr = if mo <= 2 { y + 1 } else { y };
-    format!("{yr:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    format!("{yr:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_datetime;
+
+    #[test]
+    fn device_datetime_has_no_utc_designator() {
+        assert_eq!(device_datetime(0), "1970-01-01T00:00:00");
+        assert_eq!(device_datetime(1_790_844_311), "2026-10-01T08:45:11");
+    }
 }

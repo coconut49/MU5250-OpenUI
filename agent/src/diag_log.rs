@@ -10,7 +10,7 @@ use std::os::fd::FromRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::csv_utils::{chrono_lite, now_secs};
+use crate::csv_utils::{device_datetime, now_secs};
 
 pub const LOG_PATH: &str = "/data/local/tmp/zte-agent.log";
 /// Per file; one rotated copy (`.1`) is kept, so at most twice this on flash.
@@ -93,11 +93,11 @@ impl Log {
     }
 
     fn write(&mut self, text: &str) {
-        // The firmware keeps local time in the system clock (TZ is "UTC"), so
-        // the stamp is device-local time, not UTC; drop chrono_lite's `Z`.
-        let stamp = chrono_lite(now_secs());
-        let stamp = stamp.trim_end_matches('Z');
-        let entry = format!("{stamp} up={}s {text}\n", uptime_secs());
+        let entry = format!(
+            "{} up={}s {text}\n",
+            device_datetime(now_secs()),
+            uptime_secs()
+        );
         if self.written + entry.len() as u64 > self.max {
             self.rotate();
         }

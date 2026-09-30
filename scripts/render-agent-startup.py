@@ -20,7 +20,9 @@ def render(password: str, pin: str = "") -> str:
     lines.append(f"export ZTE_AGENT_PIN={shlex.quote(pin)}" if pin else "unset ZTE_AGENT_PIN")
     # Ignore HUP before forking: legacy ADB can close before nohup executes.
     lines.append("trap '' HUP")
-    lines.append("nohup sh -c '/data/zte-agent 2>&1 | logger -t zte-agent' >/dev/null 2>&1 </dev/null &")
+    # The agent writes its own log (/data/local/tmp/zte-agent.log); syslog here
+    # keeps emergency messages only, so a logger pipe would discard everything.
+    lines.append("nohup /data/zte-agent >/dev/null 2>&1 </dev/null &")
     return "\n".join(lines) + "\n"
 
 

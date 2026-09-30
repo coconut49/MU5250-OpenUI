@@ -581,10 +581,8 @@ fn startup_script(password: &str, pin: &str) -> String {
         lines.push("unset ZTE_AGENT_PIN".into());
     }
     lines.extend([
-        "# Log via syslog (logd's fixed-size ring buffer) rather than a file on /tmp:".into(),
-        "# Read it back with: logread -e zte-agent".into(),
-        "trap '' HUP\nnohup sh -c '/data/zte-agent 2>&1 | logger -t zte-agent' >/dev/null 2>&1 </dev/null &"
-            .into(),
+        "# The agent writes its own rotated log: /data/local/tmp/zte-agent.log".into(),
+        "trap '' HUP\nnohup /data/zte-agent >/dev/null 2>&1 </dev/null &".into(),
     ]);
     format!("{}\n", lines.join("\n"))
 }

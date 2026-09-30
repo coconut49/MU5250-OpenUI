@@ -69,8 +69,11 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
   Each file is capped at 256 KiB, one rotated `.1` copy is kept, and identical
   consecutive lines are collapsed into a count. Syslog isn't usable here: the
   stock busybox `syslogd` runs with `-l 1` (emergency only) and has no `logread`
-  backend. The startup script's `| logger` pipe is left over from before; it
-  receives nothing and exits.
+  backend. The startup script sends the agent's output to `/dev/null`, and the
+  agent redirects its own stdout/stderr at startup. Timestamps in this log and
+  in the CSV logs are device-local time without a `Z`. The firmware keeps local
+  time in the system clock with `TZ=UTC`, so epoch values from the device
+  differ from true UTC by the local offset.
 
 ## Safety constraints built into the agent
 

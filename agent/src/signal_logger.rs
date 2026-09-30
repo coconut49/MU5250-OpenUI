@@ -1,4 +1,4 @@
-use crate::csv_utils::{chrono_lite, csv_escape, str_field};
+use crate::csv_utils::{csv_escape, device_datetime, str_field};
 use crate::handlers::AppState;
 use serde_json::Value;
 pub type SignalLogger = crate::logging::Session;
@@ -24,7 +24,7 @@ fn format_row(ts: u64, data: &Value) -> String {
         .collect();
 
     // ISO 8601 timestamp
-    let dt = chrono_lite(ts);
+    let dt = device_datetime(ts);
 
     format!(
         "{ts},{dt},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",

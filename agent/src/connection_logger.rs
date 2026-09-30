@@ -1,4 +1,4 @@
-use crate::csv_utils::{chrono_lite, csv_escape, str_field};
+use crate::csv_utils::{csv_escape, device_datetime, str_field};
 use crate::handlers::AppState;
 use serde_json::Value;
 pub type ConnectionLogger = crate::logging::Session;
@@ -31,7 +31,7 @@ const HEADER: &str = "timestamp,datetime,event_type,detail,old_value,new_value";
 fn rows(ts: u64, data: &Value, previous: &mut Option<Value>) -> Vec<String> {
     let cur = Snapshot::from(data);
     let prev = previous.as_ref().map(Snapshot::from);
-    let dt = chrono_lite(ts);
+    let dt = device_datetime(ts);
     let mut output = Vec::new();
     if let Some(ref p) = prev {
         // Detect changes
