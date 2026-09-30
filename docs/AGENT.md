@@ -19,7 +19,7 @@ canonical routing table; this document summarizes it.
 
 Every route below has a dashboard consumer, and every call the dashboard makes
 is a route below — `scripts/check-api-contract.py` enforces both directions
-(plus that the mock agent stays in step). 55 paths / 60 method+path pairs.
+(plus that the mock agent stays in step). 58 paths / 63 method+path pairs.
 
 | Family | Endpoints |
 |---|---|
@@ -50,8 +50,8 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
   stack and no HTTP client — removing the DoH proxy, SMS forwarder and speed
   test dropped `ureq`, and with it rustls/ring/ICU.
 - **Subprocess cost**: every `ubus`/`uci` read is a fork+exec, which dominates
-  the agent's CPU. `cache.rs` gives each dashboard source its own TTL (signal
-  2.5 s, thermal 10 s, wan/wan6 30 s, data usage 30 s, cycle dates 300 s), so
+  the agent's CPU (about 4–5 ms per `ubus call` on-device). `cache.rs` gives
+  each dashboard source its own TTL (signal 1 s, WAN throughput 1 s, thermal 10 s, wan/wan6 30 s, data usage 30 s, cycle dates 300 s), so
   the client's poll rate is decoupled from the refresh rate and concurrent
   clients collapse onto one refresh. `wifi_status` dumps whole configs with
   `ubus::uci_show` instead of issuing one `uci get` per key.
@@ -64,8 +64,13 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
   enabled would come back up forwarding DNS to a dead port), applies
   `start_ttl.sh` if present, and re-applies persisted NCM only if explicitly
   enabled — see [SAFETY.md](SAFETY.md) §2 for why the latter two are acceptable.
-- **Logging**: stdout/stderr go to syslog via `logger -t zte-agent`
-  (`logread -e zte-agent`), not a file on tmpfs.
+- **Logging**: the agent redirects its own stdout/stderr (`diag_log.rs`) to
+  `/data/local/tmp/zte-agent.log`. Lines carry the device's local time and uptime.
+  Each file is capped at 256 KiB, one rotated `.1` copy is kept, and identical
+  consecutive lines are collapsed into a count. Syslog isn't usable here: the
+  stock busybox `syslogd` runs with `-l 1` (emergency only) and has no `logread`
+  backend. The startup script's `| logger` pipe is left over from before; it
+  receives nothing and exits.
 
 ## Safety constraints built into the agent
 
