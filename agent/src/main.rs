@@ -7,6 +7,7 @@ mod charge_policy;
 mod connection_logger;
 mod csv_utils;
 mod device_ext;
+mod diag_log;
 mod event_bus;
 mod handlers;
 mod lan;
@@ -36,6 +37,13 @@ const DEFAULT_THREADS: usize = 4;
 const STARTUP_SCRIPT: &str = "/data/local/tmp/start_zte_agent.sh";
 
 fn main() {
+    diag_log::init();
+    eprintln!(
+        "[agent] zte-agent {} starting (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
+
     let threads: usize = std::env::var("ZTE_AGENT_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
