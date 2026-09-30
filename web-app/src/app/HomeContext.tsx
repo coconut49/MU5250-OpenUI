@@ -52,7 +52,7 @@ export function deriveAlerts(data: HomeData | null): Alert[] {
     } else if (temp != null && temp >= 45) {
       alerts.push({ level: 'warning', message: `Battery temperature high (${temp.toFixed(0)}°C)` })
     }
-    if (!battery.charging) {
+    if (!battery.plugged) {
       if (battery.percent <= 5) {
         alerts.push({ level: 'error', message: `Battery critically low (${battery.percent}%)` })
       } else if (battery.percent <= 15) {

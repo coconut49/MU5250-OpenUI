@@ -2,6 +2,7 @@ import { useHome } from '../../app/HomeContext'
 import { formatBandwidthMHz, formatBytes, formatSpeed, formatUptime, modemMode, qualityLabel, qualityText, rsrpQuality, sumBandwidthMHz } from '../../format'
 import { IBolt, IDownload, IUpload } from '../../icons'
 import { Card, Chip, Meter, Row, SignalBars, Skeleton } from '../../ui/primitives'
+import type { BatteryInfo } from '../../types'
 
 function PageSkeleton() {
   return (
@@ -115,7 +116,7 @@ export default function HomePage() {
             <p className="tnum mt-2 font-mono text-2xl font-medium leading-none text-ink">
               {battery?.percent != null ? `${battery.percent}%` : '\u2014'}
             </p>
-            <p className="mt-1.5 text-meta text-ink2">{battery?.charging ? 'Charging' : 'On battery'}</p>
+            <p className="mt-1.5 text-meta text-ink2">{batteryState(battery)}</p>
             <p className="tnum mt-3 truncate font-mono text-caption text-ink3">
               {battery?.voltage_mv ? `${(battery.voltage_mv / 1000).toFixed(2)} V` : '\u2014'}
               {battery?.temperature_c != null ? ` · ${battery.temperature_c.toFixed(1)}°C` : ''}
@@ -227,4 +228,11 @@ export default function HomePage() {
       </div>
     </div>
   )
+}
+
+function batteryState(battery: BatteryInfo | null | undefined): string {
+  if (!battery) return '\u2014'
+  if (battery.charging) return 'Charging'
+  if (battery.status === 'Full') return 'Full'
+  return battery.plugged ? 'Plugged in, not charging' : 'On battery'
 }

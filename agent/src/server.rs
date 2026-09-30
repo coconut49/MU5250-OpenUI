@@ -26,7 +26,7 @@ const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 
 pub fn start(threads: usize, state: Arc<AppState>) {
-    // Seed the CPU tracker with a baseline (speed tracker self-seeds)
+    // Seed the CPU tracker with a baseline
     state.cpu.seed();
 
     // tiny_http's accept thread exits permanently on its first accept() error

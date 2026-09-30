@@ -33,7 +33,11 @@ export interface SignalInfo {
 
 export interface BatteryInfo {
   percent: number
+  /** Raw kernel status: Charging, Full, Not charging, Discharging. */
+  status?: string
   charging: boolean
+  /** On external power, whether or not the battery is charging. */
+  plugged: boolean
   voltage_mv?: number
   temperature_c?: number
   current_ma?: number
@@ -49,7 +53,11 @@ export interface SpeedInfo {
 
 export interface DeviceInfo {
   model: string
+  /** ZTE build, e.g. XCBZ_HK_MU5250V1.0.0B04. */
   firmware?: string
+  hardware?: string
+  /** Kernel release from /proc/version. */
+  kernel?: string
   uptime_secs?: number
   load_avg?: number[]
 }

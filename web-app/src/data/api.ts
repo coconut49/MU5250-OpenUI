@@ -101,13 +101,29 @@ function parseNum(v: unknown): number | undefined {
   return undefined
 }
 
-function formatCellId(id?: number | string | null): string | undefined {
-  if (id == null) return undefined
-  const num = typeof id === 'string' ? parseInt(id, 10) : id
-  if (isNaN(num) || num <= 0) return undefined
-  const nodeId = num >>> 8
-  const sectorId = num & 0xff
-  return `${nodeId.toString(16).toUpperCase()}|${sectorId.toString(16).toUpperCase()}`
+function parseCellId(id?: unknown): number | undefined {
+  const num = typeof id === 'string' ? Number(id.trim()) : typeof id === 'number' ? id : NaN
+  return Number.isSafeInteger(num) && num > 0 ? num : undefined
+}
+
+/**
+ * LTE ECI (28 bits) splits at a fixed point: eNB ID (20 bits) | cell (8 bits).
+ * Plain arithmetic, not bit operators, which truncate to 32 bits.
+ */
+function formatEci(id?: unknown): string | undefined {
+  const eci = parseCellId(id)
+  if (eci == null) return undefined
+  const hex = (n: number) => n.toString(16).toUpperCase()
+  return `${hex(Math.floor(eci / 256))}|${hex(eci % 256)}`
+}
+
+/**
+ * NR NCI is 36 bits and the gNB/cell split is operator-configured (22–32 bit
+ * gNB ID), so no split can be derived from the NCI alone. Show it whole.
+ */
+function formatNci(id?: unknown): string | undefined {
+  const nci = parseCellId(id)
+  return nci == null ? undefined : nci.toString(16).toUpperCase()
 }
 
 /** Parse lteca entries, returning SCCs only (excluding PCC by PCI+EARFCN match). */
@@ -161,6 +177,9 @@ function parseCaSig(sigStr: string) {
 }
 
 // ── Mappers ───────────────────────────────────────────────────────────────────
+
+/** Lowest reportable NR RSRP; the modem reports it for unmeasured carriers. */
+const NR_RSRP_FLOOR = -140
 
 export function mapSignal(d: Record<string, unknown>): SignalInfo {
   const pccPci = d.lte_pci as number | undefined
@@ -254,6 +273,10 @@ export function mapSignal(d: Record<string, unknown>): SignalInfo {
       if (sPci === nrPccPci && sArfcn === nrPccArfcn) continue
       const sBand = parseInt(parts[3]) || 0
       const sBw = parts[5]
+      // A configured-but-unmeasured SCC reports the 3GPP reporting floors
+      // (RSRP -140, RSRQ -43, SINR -23): no measurement, not a real reading.
+      const sRsrp = parts.length >= 8 ? parseNum(parts[7]) : undefined
+      const measured = sRsrp != null && sRsrp > NR_RSRP_FLOOR
       nrCarriers.push({
         label: `SCC${nrCarriers.length - 1}`,
         band: `n${sBand}`,
@@ -261,10 +284,10 @@ export function mapSignal(d: Record<string, unknown>): SignalInfo {
         earfcn: sArfcn,
         bandwidth: `${sBw} MHz`,
         freq: sArfcn ? nrarfcnToFreq(sArfcn) : undefined,
-        rsrp: parts.length >= 8 ? parseNum(parts[7]) : undefined,
-        rsrq: parts.length >= 9 ? parseNum(parts[8]) : undefined,
-        sinr: parts.length >= 10 ? parseNum(parts[9]) : undefined,
-        rssi: parts.length >= 11 ? parseNum(parts[10]) : undefined,
+        rsrp: measured ? sRsrp : undefined,
+        rsrq: measured && parts.length >= 9 ? parseNum(parts[8]) : undefined,
+        sinr: measured && parts.length >= 10 ? parseNum(parts[9]) : undefined,
+        rssi: measured && parts.length >= 11 ? parseNum(parts[10]) : undefined,
         ul_configured: parts.length > 0 ? parts[0].trim() === '1' : undefined,
         active: parts.length > 2 ? parts[2].trim() === '2' : undefined,
       })
@@ -301,13 +324,16 @@ export function mapSignal(d: Record<string, unknown>): SignalInfo {
 
   const netType = d.network_type as string | undefined
   const is4g = netType === '4G' || netType === 'LTE' || netType === 'NSA' || netType === 'ENDC'
-  const rawCellId = is4g && d.cell_id ? d.cell_id : d.nr5g_cell_id || d.cell_id
+  // NSA/ENDC camps on the LTE anchor, so its LTE cell is the serving cell.
+  const cellId = is4g && parseCellId(d.cell_id) != null
+    ? formatEci(d.cell_id)
+    : formatNci(d.nr5g_cell_id) ?? formatEci(d.cell_id)
 
   return {
     type: netType,
     carrier: (d.network_provider_fullname || d.network_provider) as string | undefined,
     signal_bars: d.signalbar ? parseInt(d.signalbar as string) : undefined,
-    cell_id: formatCellId(rawCellId as number | string | undefined),
+    cell_id: cellId,
     lte_carriers: lteCarriers,
     nr_carriers: nrCarriers,
     net_select: d.net_select as string | undefined,
@@ -321,9 +347,14 @@ export function mapSignal(d: Record<string, unknown>): SignalInfo {
 }
 
 function mapBattery(d: Record<string, unknown>): BatteryInfo {
+  const status = typeof d.status === 'string' ? d.status : undefined
   return {
     percent: d.capacity as number,
-    charging: d.status === 'Charging',
+    status,
+    charging: status === 'Charging',
+    // USB supply present and not feeding a powerbank load. Covers "Full" and
+    // "Not charging" (e.g. the charge limit paused charging while plugged in).
+    plugged: status === 'Charging' || (d.external_power === true && status !== 'Discharging'),
     voltage_mv: d.voltage_uv ? Math.round((d.voltage_uv as number) / 1000) : undefined,
     temperature_c: d.temperature ? (d.temperature as number) / 10 : undefined,
     current_ma: d.current_ua ? Math.round((d.current_ua as number) / 1000) : undefined,
@@ -331,8 +362,9 @@ function mapBattery(d: Record<string, unknown>): BatteryInfo {
 }
 
 /**
- * Map the agent's `SpeedSnapshot` (agent/src/system.rs) — sysfs rmnet counters
- * sampled once a second into a rolling window. Rates are bytes/sec.
+ * Map the agent's `SpeedSnapshot` (agent/src/system.rs) — the modem's own WAN
+ * counters (including IPA-offloaded traffic), averaged between agent samples.
+ * Rates are bytes/sec.
  */
 function mapSpeed(d: Record<string, unknown>): SpeedInfo {
   return {
@@ -345,10 +377,11 @@ function mapSpeed(d: Record<string, unknown>): SpeedInfo {
 
 function mapDevice(d: Record<string, unknown>): DeviceInfo {
   const kernel = d.kernel as string | undefined
-  const ver = kernel?.match(/Linux version (\S+)/)?.[1]
   return {
     model: 'ZTE U60 Pro',
-    firmware: ver,
+    firmware: typeof d.firmware === 'string' ? d.firmware : undefined,
+    hardware: typeof d.hardware === 'string' ? d.hardware : undefined,
+    kernel: kernel?.match(/Linux version (\S+)/)?.[1],
     uptime_secs: d.uptime_secs as number | undefined,
     load_avg: d.load_avg as number[] | undefined,
   }

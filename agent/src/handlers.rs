@@ -10,7 +10,7 @@ use crate::cache::{Cached, Observed, Sample};
 use crate::charge_policy::ChargeLimitEnforcer;
 use crate::connection_logger::ConnectionLogger;
 use crate::signal_logger::SignalLogger;
-use crate::system::{self, CpuTracker, ProcessTracker, SpeedTracker};
+use crate::system::{self, CpuTracker, FirmwareInfo, ProcessTracker, SpeedTracker};
 use crate::ubus;
 
 // Per-source freshness for the dashboard batch. Every entry below costs a
@@ -39,6 +39,7 @@ pub struct AppState {
     pub auth: AuthState,
     pub cpu: CpuTracker,
     pub speed: SpeedTracker,
+    pub firmware: FirmwareInfo,
     pub proc_tracker: ProcessTracker,
     pub at_port: AtPort,
     pub dash: DashboardCache,
@@ -58,6 +59,7 @@ impl AppState {
             auth: AuthState::new(),
             cpu: CpuTracker::new(),
             speed: SpeedTracker::new(),
+            firmware: FirmwareInfo::new(),
             proc_tracker: ProcessTracker::new(),
             at_port: AtPort::new(),
             dash: DashboardCache::default(),
@@ -131,17 +133,24 @@ fn is_mobile_user_agent(user_agent: &str) -> bool {
 
 /// GET /api/device
 pub fn device(state: &AppState) -> (u16, Value) {
+    let mut data = device_json(state);
+    data["auth"] = json!({"pin_enabled": state.auth.has_pin()});
+    (200, json!({"ok": true, "data": data}))
+}
+
+/// Shared by `/api/device` and the dashboard batch. `kernel` is the raw
+/// `/proc/version`; `firmware` is the ZTE build, which is what users mean.
+fn device_json(state: &AppState) -> Value {
     let info = system::read_device_info();
-    (
-        200,
-        json!({"ok": true, "data": {
-            "auth": {"pin_enabled": state.auth.has_pin()},
-            "hostname": info.hostname,
-            "uptime_secs": info.uptime_secs,
-            "load_avg": info.load_avg,
-            "kernel": info.kernel,
-        }}),
-    )
+    let firmware = state.firmware.get();
+    json!({
+        "hostname": info.hostname,
+        "uptime_secs": info.uptime_secs,
+        "load_avg": info.load_avg,
+        "kernel": info.kernel,
+        "firmware": firmware.as_ref().and_then(|f| f.version.clone()),
+        "hardware": firmware.and_then(|f| f.hardware),
+    })
 }
 
 /// GET /api/cpu
@@ -324,8 +333,9 @@ pub fn system_kill_bloat(_state: &AppState, body: &[u8]) -> (u16, Value) {
 pub fn dashboard(state: &AppState) -> (u16, Value) {
     let cache = &state.dash;
 
-    // procfs / sysfs — no subprocess, read fresh every time.
-    let device_info = system::read_device_info();
+    // procfs / sysfs — no subprocess, read fresh every time. The firmware
+    // identity inside `device_json` is read once and kept.
+    let device = device_json(state);
     let battery = system::read_battery();
     let cpu_usage = state.cpu.sample();
     let meminfo = system::read_meminfo();
@@ -347,19 +357,14 @@ pub fn dashboard(state: &AppState) -> (u16, Value) {
         .read(DATA_USAGE_TTL, || read_data_usage_live(cache));
 
     let mut result = serde_json::Map::new();
-    result.insert(
-        "device".into(),
-        json!({
-            "hostname": device_info.hostname,
-            "uptime_secs": device_info.uptime_secs,
-            "load_avg": device_info.load_avg,
-            "kernel": device_info.kernel,
-        }),
-    );
+    result.insert("device".into(), device);
     result.insert("battery".into(), json!(battery));
     result.insert("cpu".into(), json!(cpu_usage));
     result.insert("memory".into(), json!(meminfo));
-    result.insert("speed".into(), json!(speed));
+    result.insert(
+        "speed".into(),
+        speed.value.map(|v| json!(v)).unwrap_or(Value::Null),
+    );
     result.insert("data_usage".into(), data_usage.value.unwrap_or(Value::Null));
     result.insert("signal".into(), signal.value.unwrap_or(Value::Null));
     result.insert("wan".into(), wan.value.unwrap_or(Value::Null));
@@ -370,6 +375,7 @@ pub fn dashboard(state: &AppState) -> (u16, Value) {
         json!({
             "signal": signal.freshness, "wan": wan.freshness, "wan6": wan6.freshness,
             "thermal": thermal.freshness, "data_usage": data_usage.freshness,
+            "speed": speed.freshness,
         }),
     );
     result.insert(

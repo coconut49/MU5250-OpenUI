@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::cache::Cached;
+use crate::cache::{Cached, Observed, Sample};
 use crate::util::MutexExt;
 
 /// Shortest window a CPU delta is computed over. Both `/api/cpu` and the
@@ -227,6 +227,9 @@ pub struct BatteryInfo {
     pub voltage_uv: i64,
     pub current_ua: i64,
     pub temperature: i64,
+    /// USB supply present (`power_supply/usb/online`). Status alone cannot
+    /// tell "plugged in, charging paused" from "on battery".
+    pub external_power: Option<bool>,
 }
 
 pub fn read_battery() -> Option<BatteryInfo> {
@@ -249,55 +252,24 @@ pub fn read_battery() -> Option<BatteryInfo> {
         voltage_uv: read_i64("voltage_now"),
         current_ua: read_i64("current_now"),
         temperature: read_i64("temp"),
+        external_power: fs::read_to_string("/sys/class/power_supply/usb/online")
+            .ok()
+            .and_then(|v| match v.trim() {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            }),
     })
 }
 
-#[derive(Serialize)]
-pub struct NetInterface {
-    pub name: String,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
-    pub rx_packets: u64,
-    pub tx_packets: u64,
-}
+// -- WAN throughput (modem data counters) --
 
-pub fn read_network_traffic() -> Vec<NetInterface> {
-    let content = match fs::read_to_string("/proc/net/dev") {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let mut ifaces = Vec::new();
-    for line in content.lines().skip(2) {
-        let line = line.trim();
-        let Some((name, rest)) = line.split_once(':') else {
-            continue;
-        };
-        let vals: Vec<u64> = rest
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if vals.len() >= 10 {
-            ifaces.push(NetInterface {
-                name: name.trim().to_string(),
-                rx_bytes: vals[0],
-                rx_packets: vals[1],
-                tx_bytes: vals[8],
-                tx_packets: vals[9],
-            });
-        }
-    }
-    ifaces
-}
-
-// -- Speed tracker (ring buffer + background sampler for IPA batch smoothing) --
-
-const SPEED_RING_SIZE: usize = 16; // 16 samples × 1s = 16s window
-
-struct NetSample {
-    rx_bytes: u64,
-    tx_bytes: u64,
-    time: Instant,
-}
+/// Minimum spacing between counter reads. Each read is one `ubus` call, and
+/// concurrent dashboard clients share it.
+const SPEED_TTL: Duration = Duration::from_secs(1);
+/// A previous sample older than this no longer describes the current rate (the
+/// dashboard was idle), so the firmware's own one-second rate is used instead.
+const SPEED_MAX_WINDOW: Duration = Duration::from_secs(10);
 
 /// Live WAN throughput. Field names are part of the dashboard contract —
 /// `web-app/src/data/api.ts::mapSpeed` reads them verbatim.
@@ -307,114 +279,170 @@ pub struct SpeedSnapshot {
     pub tx_bytes: u64,
     pub rx_speed: f64,
     pub tx_speed: f64,
-    /// Highest rate observed since the agent started (smoothed over the ring window).
+    /// Highest one-second rate the modem has seen on this data connection.
     pub max_rx_speed: f64,
     pub max_tx_speed: f64,
     pub elapsed_ms: u64,
 }
 
+/// `zwrt_data get_wwandst` "real" (current connection) counters.
+#[derive(Clone, Copy)]
+struct WanCounters {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    /// Bytes transferred in the modem's last one-second window.
+    rx_speed: u64,
+    tx_speed: u64,
+    max_rx_speed: u64,
+    max_tx_speed: u64,
+}
+
+/// Throughput from the modem's own data counters.
+///
+/// The `rmnet_*` netdev counters this used to sample miss most tethered
+/// traffic: IPA hardware offload forwards it without touching the host stack
+/// (on-device they read ~17x less than the modem counter). The modem's
+/// `real_*` counters include offloaded traffic.
 pub struct SpeedTracker {
-    latest: Arc<Mutex<SpeedSnapshot>>,
+    source: Observed<SpeedSnapshot>,
+    previous: Mutex<Option<(Instant, WanCounters)>>,
 }
 
 impl SpeedTracker {
     pub fn new() -> Self {
-        let ring = Arc::new(Mutex::new(VecDeque::with_capacity(SPEED_RING_SIZE)));
-        let latest = Arc::new(Mutex::new(SpeedSnapshot {
-            rx_bytes: 0,
-            tx_bytes: 0,
-            rx_speed: 0.0,
-            tx_speed: 0.0,
-            max_rx_speed: 0.0,
-            max_tx_speed: 0.0,
-            elapsed_ms: 0,
-        }));
+        Self {
+            source: Observed::default(),
+            previous: Mutex::new(None),
+        }
+    }
 
-        // Seed with initial sample
-        let (rx, tx) = read_rmnet_bytes();
-        ring.safe_lock().push_back(NetSample {
-            rx_bytes: rx,
-            tx_bytes: tx,
-            time: Instant::now(),
-        });
-
-        // Background sampler thread
-        let ring_c = Arc::clone(&ring);
-        let latest_c = Arc::clone(&latest);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let (rx, tx) = read_rmnet_bytes();
+    pub fn sample(&self) -> Sample<SpeedSnapshot> {
+        self.source.read(SPEED_TTL, || {
+            let current = read_wan_counters()?;
             let now = Instant::now();
-            let mut buf = ring_c.safe_lock();
-            if buf.len() >= SPEED_RING_SIZE {
-                buf.pop_front();
-            }
-            buf.push_back(NetSample {
-                rx_bytes: rx,
-                tx_bytes: tx,
-                time: now,
-            });
-
-            // Compute rolling speed from oldest to newest
-            if buf.len() >= 2 {
-                let oldest = &buf[0];
-                let newest = buf.back().unwrap();
-                let secs = newest.time.duration_since(oldest.time).as_secs_f64();
-                if secs > 0.1 {
-                    let rx_speed = newest.rx_bytes.saturating_sub(oldest.rx_bytes) as f64 / secs;
-                    let tx_speed = newest.tx_bytes.saturating_sub(oldest.tx_bytes) as f64 / secs;
-                    let mut latest = latest_c.safe_lock();
-                    let max_rx_speed = latest.max_rx_speed.max(rx_speed);
-                    let max_tx_speed = latest.max_tx_speed.max(tx_speed);
-                    *latest = SpeedSnapshot {
-                        rx_bytes: newest.rx_bytes,
-                        tx_bytes: newest.tx_bytes,
-                        rx_speed,
-                        tx_speed,
-                        max_rx_speed,
-                        max_tx_speed,
-                        elapsed_ms: (secs * 1000.0) as u64,
-                    };
-                }
-            }
-        });
-
-        Self { latest }
-    }
-
-    pub fn sample(&self) -> SpeedSnapshot {
-        self.latest.safe_lock().clone()
+            let mut previous = self.previous.safe_lock();
+            let snapshot = speed_snapshot(previous.as_ref(), now, &current);
+            *previous = Some((now, current));
+            Ok(snapshot)
+        })
     }
 }
 
-fn read_rmnet_bytes() -> (u64, u64) {
-    let mut rx_total: u64 = 0;
-    let mut tx_total: u64 = 0;
-    for iface in &["rmnet_data0", "rmnet_ipa0"] {
-        let base = format!("/sys/class/net/{iface}/statistics");
-        if let (Some(rx), Some(tx)) = (
-            read_sysfs_u64(&format!("{base}/rx_bytes")),
-            read_sysfs_u64(&format!("{base}/tx_bytes")),
-        ) {
-            rx_total += rx;
-            tx_total += tx;
+fn read_wan_counters() -> Result<WanCounters, String> {
+    let stats = crate::ubus::call(
+        "zwrt_data",
+        "get_wwandst",
+        Some(r#"{"source_module":"web","cid":1,"type":4}"#),
+    )?;
+    let counter = |key: &str| -> Result<u64, String> {
+        match stats.get(key) {
+            Some(serde_json::Value::Number(n)) => n.as_u64(),
+            Some(serde_json::Value::String(s)) => s.trim().parse().ok(),
+            _ => None,
         }
-    }
-    if rx_total > 0 || tx_total > 0 {
-        return (rx_total, tx_total);
-    }
-    // Fallback: parse both from /proc/net/dev
-    for iface in read_network_traffic() {
-        if iface.name == "rmnet_data0" || iface.name == "rmnet_ipa0" {
-            rx_total += iface.rx_bytes;
-            tx_total += iface.tx_bytes;
-        }
-    }
-    (rx_total, tx_total)
+        .ok_or_else(|| format!("get_wwandst: {key} unavailable"))
+    };
+    Ok(WanCounters {
+        rx_bytes: counter("real_rx_bytes")?,
+        tx_bytes: counter("real_tx_bytes")?,
+        rx_speed: counter("real_rx_speed")?,
+        tx_speed: counter("real_tx_speed")?,
+        max_rx_speed: counter("real_max_rx_speed").unwrap_or(0),
+        max_tx_speed: counter("real_max_tx_speed").unwrap_or(0),
+    })
 }
 
-fn read_sysfs_u64(path: &str) -> Option<u64> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Average rate since the previous sample, which smooths the modem's spiky
+/// one-second figure across the dashboard's poll interval. Falls back to that
+/// figure when there is no recent sample or the counters reset (reconnect).
+fn speed_snapshot(
+    previous: Option<&(Instant, WanCounters)>,
+    now: Instant,
+    current: &WanCounters,
+) -> SpeedSnapshot {
+    let window = previous.and_then(|(at, prev)| {
+        let elapsed = now.saturating_duration_since(*at);
+        (elapsed > Duration::ZERO
+            && elapsed <= SPEED_MAX_WINDOW
+            && current.rx_bytes >= prev.rx_bytes
+            && current.tx_bytes >= prev.tx_bytes)
+            .then_some((elapsed, prev))
+    });
+    let (rx_speed, tx_speed, elapsed_ms) = match window {
+        Some((elapsed, prev)) => {
+            let secs = elapsed.as_secs_f64();
+            (
+                (current.rx_bytes - prev.rx_bytes) as f64 / secs,
+                (current.tx_bytes - prev.tx_bytes) as f64 / secs,
+                elapsed.as_millis() as u64,
+            )
+        }
+        None => (current.rx_speed as f64, current.tx_speed as f64, 1000),
+    };
+    SpeedSnapshot {
+        rx_bytes: current.rx_bytes,
+        tx_bytes: current.tx_bytes,
+        rx_speed,
+        tx_speed,
+        max_rx_speed: (current.max_rx_speed as f64).max(rx_speed),
+        max_tx_speed: (current.max_tx_speed as f64).max(tx_speed),
+        elapsed_ms,
+    }
+}
+
+// -- Firmware identity --
+
+/// Retry spacing while the firmware identity cannot be read (early boot).
+const FIRMWARE_RETRY: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Serialize)]
+pub struct FirmwareIdentity {
+    /// ZTE build, e.g. `XCBZ_HK_MU5250V1.0.0B04`.
+    pub version: Option<String>,
+    pub hardware: Option<String>,
+}
+
+/// Firmware build from `zwrt_zte_mdm.api get_zwrt_common_info`. It cannot
+/// change without a reboot, so the first successful read is kept for the life
+/// of the process.
+pub struct FirmwareInfo {
+    state: Mutex<(Option<FirmwareIdentity>, Option<Instant>)>,
+}
+
+impl FirmwareInfo {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new((None, None)),
+        }
+    }
+
+    pub fn get(&self) -> Option<FirmwareIdentity> {
+        let mut state = self.state.safe_lock();
+        if state.0.is_some() {
+            return state.0.clone();
+        }
+        if state.1.is_some_and(|at| at.elapsed() < FIRMWARE_RETRY) {
+            return None;
+        }
+        state.1 = Some(Instant::now());
+        let info =
+            crate::ubus::call("zwrt_zte_mdm.api", "get_zwrt_common_info", Some("{}")).ok()?;
+        let text = |key: &str| {
+            info.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let identity = FirmwareIdentity {
+            version: text("integrate_version"),
+            hardware: text("hardware_version"),
+        };
+        if identity.version.is_some() {
+            state.0 = Some(identity.clone());
+        }
+        Some(identity)
+    }
 }
 
 // -- Process monitor --
@@ -827,6 +855,49 @@ mod tests {
                 "tx_speed",
             ]
         );
+    }
+
+    fn counters(rx_bytes: u64, tx_bytes: u64) -> WanCounters {
+        WanCounters {
+            rx_bytes,
+            tx_bytes,
+            rx_speed: 7,
+            tx_speed: 3,
+            max_rx_speed: 1_000,
+            max_tx_speed: 500,
+        }
+    }
+
+    #[test]
+    fn speed_is_averaged_over_the_sample_window() {
+        let then = Instant::now();
+        let now = then + Duration::from_secs(2);
+        let snap = speed_snapshot(
+            Some(&(then, counters(1_000, 100))),
+            now,
+            &counters(9_000, 700),
+        );
+        assert_eq!(snap.rx_speed, 4_000.0);
+        assert_eq!(snap.tx_speed, 300.0);
+        assert_eq!(snap.elapsed_ms, 2_000);
+        // A window average above the modem's recorded peak raises the peak.
+        assert_eq!(snap.max_rx_speed, 4_000.0);
+        assert_eq!(snap.max_tx_speed, 500.0);
+    }
+
+    #[test]
+    fn speed_falls_back_to_modem_rate_without_a_usable_window() {
+        let then = Instant::now();
+        let current = counters(9_000, 700);
+        // First sample, stale sample, and counters reset by a reconnect.
+        for previous in [
+            None,
+            Some((then, counters(1_000, 100))),
+            Some((then + Duration::from_secs(29), counters(50_000, 100))),
+        ] {
+            let snap = speed_snapshot(previous.as_ref(), then + Duration::from_secs(30), &current);
+            assert_eq!((snap.rx_speed, snap.tx_speed), (7.0, 3.0));
+        }
     }
 
     #[test]

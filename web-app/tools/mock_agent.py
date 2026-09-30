@@ -57,9 +57,10 @@ def signal_raw():
         "nr5g_rsrq": "-9.2",
         "nr5g_rssi": "-58",
         "nr5g_cell_id": 268566611,
-        # NR CA: one SCC (n40, ARFCN 472000, PCI 803, 40 MHz).
+        # NR CA: one active SCC (n40, ARFCN 472000, PCI 803, 40 MHz).
         # Indices: 0=ul,1=pci,2=active,3=band,4=arfcn,5=bw,6=pad,7=rsrp,8=rsrq,9=sinr,10=rssi
-        "nrca": "1,803,2,40,472000,40,0,-88,-11.4,12.5,-69",
+        # Second entry: a configured but unmeasured SCC (reporting-floor values).
+        "nrca": "1,803,2,40,472000,40,0,-88,-11.4,12.5,-69;0,56,1,78,643392,60,1,-140.0,-43.0,-23.0,-120.0;",
         # No locks active
         "lte_band_lock": "0",
         "nr5g_sa_band_lock": "",
@@ -77,6 +78,8 @@ def dashboard_batch():
             "load_avg": [0.42, 0.35, 0.31],
             "kernel": "Linux version 5.15.170-perf (builder@zte) "
                       "(aarch64-openwrt-linux-musl-gcc 12.3.0) #1 SMP PREEMPT",
+            "firmware": "XCBZ_HK_MU5250V1.0.0B04",
+            "hardware": "MU5250_HW1.0",
         },
         "battery": {
             "capacity": 78,
@@ -84,6 +87,7 @@ def dashboard_batch():
             "voltage_uv": 4_210_000,
             "temperature": 330,  # tenths of a degree
             "current_ua": 1_450_000,
+            "external_power": True,
         },
         "cpu": {"overall": round(jitter(23, 0.4), 1), "cores": [31, 22, 19, 20]},
         "memory": {"total_kb": 1_638_000, "used_kb": 612_000, "free_kb": 1_026_000, "usage_pct": 37.4},
@@ -95,7 +99,7 @@ def dashboard_batch():
             "tx_speed": int(tx),
             "max_rx_speed": 712_000_000 // 8,
             "max_tx_speed": 46_000_000 // 8,
-            "elapsed_ms": 16_000,
+            "elapsed_ms": 3_000,
         },
         "data_usage": {
             "day": {"rx_bytes": 2_350_000_000, "tx_bytes": 118_000_000, "time_secs": 32_400},

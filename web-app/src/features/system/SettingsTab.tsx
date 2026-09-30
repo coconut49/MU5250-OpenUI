@@ -256,6 +256,8 @@ export default function SettingsTab({ onLogout }: { onLogout: () => void }) {
         <Card title="Device">
           <Row label="Model" value={device?.model ?? '\u2014'} mono />
           <Row label="Firmware" value={device?.firmware ?? '\u2014'} mono />
+          {device?.hardware && <Row label="Hardware" value={device.hardware} mono />}
+          <Row label="Kernel" value={device?.kernel ?? '\u2014'} mono />
           <Row label="Uptime" value={formatUptime(device?.uptime_secs)} />
           <Row label="Load" value={device?.load_avg?.map((v) => v.toFixed(2)).join(', ') ?? '\u2014'} mono />
           <Row label="IMEI" value={imei || '\u2014'} mono />
