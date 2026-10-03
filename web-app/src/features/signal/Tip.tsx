@@ -9,7 +9,8 @@ import { TIP_MAX_WIDTH, TIP_MARGIN, placeTooltip } from './tooltipPlacement'
 //   - immediately on keyboard focus,
 //   - after ~300 ms of mouse hover (timer cancelled on leave / unmount),
 //   - on tap or click (toggles; a second tap closes).
-// Escape, an outside press, scrolling and blur close it; resize re-places it.
+// Escape, an outside press, scrolling and blur close it; resize re-places it, or
+// closes it when the resize leaves the trigger entirely outside the viewport.
 // The box never takes focus and the pointer may move onto it.
 
 const HOVER_DELAY_MS = 300
@@ -73,7 +74,11 @@ export function Tip({ text, children, className = '' }: { text: string; children
       if (e.target instanceof Node && popRef.current?.contains(e.target)) return
       close()
     }
-    const onResize = () => setTick((n) => n + 1)
+    const onResize = () => {
+      const r = triggerRef.current?.getBoundingClientRect()
+      if (!r || r.bottom <= 0 || r.top >= window.innerHeight || r.right <= 0 || r.left >= window.innerWidth) close()
+      else setTick((n) => n + 1)
+    }
     document.addEventListener('keydown', onKey)
     document.addEventListener('pointerdown', onPress, true)
     window.addEventListener('scroll', onScroll, true)

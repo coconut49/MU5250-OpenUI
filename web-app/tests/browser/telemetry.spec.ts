@@ -273,6 +273,17 @@ test.describe('Metric help tooltip (U05)', () => {
     expect(box!.x + box!.width).toBeLessThanOrEqual(vp.width)
     expect(box!.y + box!.height).toBeLessThanOrEqual(vp.height)
   }
+  // Scroll the trigger into place and let the scroll event land before opening the tip,
+  // so that event cannot close it.
+  const scrollTo = (trigger: Locator, block: ScrollLogicalPosition) =>
+    trigger.evaluate(
+      (el, b) =>
+        new Promise<void>((resolve) => {
+          el.scrollIntoView({ block: b })
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+        }),
+      block,
+    )
   const disjoint = (a: { x: number; y: number; width: number; height: number }, b: typeof a) =>
     a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y
 
@@ -372,13 +383,35 @@ test.describe('Metric help tooltip (U05)', () => {
     await page.setViewportSize(VIEWPORTS.phone375)
     await openApp(page, { group: 'signal' })
     const trigger = page.getByRole('button', { name: 'RSRP', exact: true }).first()
+    // Centred at 812 px tall, the trigger stays on screen after shrinking to 568 px,
+    // whatever the platform's font metrics.
+    await scrollTo(trigger, 'center')
     await trigger.focus()
     const tip = page.getByRole('tooltip')
     await expect(tip).toBeVisible()
     await page.setViewportSize(VIEWPORTS.phone320)
-    await expect.poll(async () => (await tip.boundingBox())?.x ?? -1).toBeGreaterThanOrEqual(0)
+    await expect
+      .poll(async () => {
+        const b = await tip.boundingBox()
+        return b ? b.y + b.height : Infinity
+      })
+      .toBeLessThanOrEqual(VIEWPORTS.phone320.height)
     await inViewport(page, await tip.boundingBox())
     await page.mouse.wheel(0, 200)
+    await expect(tip).toHaveCount(0)
+  })
+
+  test('closes when a resize leaves the trigger outside the viewport', async ({ page, agent }) => {
+    dashboard(agent, { network: 'NSA' })
+    await page.setViewportSize(VIEWPORTS.phone375)
+    await openApp(page, { group: 'signal' })
+    const trigger = page.getByRole('button', { name: 'RSRP', exact: true }).first()
+    await scrollTo(trigger, 'end')
+    await trigger.focus()
+    const tip = page.getByRole('tooltip')
+    await expect(tip).toBeVisible()
+    expect((await trigger.boundingBox())!.y).toBeGreaterThanOrEqual(VIEWPORTS.phone320.height)
+    await page.setViewportSize(VIEWPORTS.phone320)
     await expect(tip).toHaveCount(0)
   })
 
