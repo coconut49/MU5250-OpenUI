@@ -37,6 +37,18 @@ jobs:
           RELEASE_SOURCE_REF: ${{ inputs.source_ref || github.ref }}
       - run: npm ci && npm run build && npm run lint && npm test
         working-directory: web-app
+      - run: npx playwright install --with-deps chromium
+        working-directory: web-app
+      - run: npm run test:browser
+        working-directory: web-app
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-failure-artifacts
+          path: |
+            web-app/playwright-report
+            web-app/test-results
+          if-no-files-found: ignore
       - run: |
           for script in setup.sh deploy.sh deploy-dashboard.sh scripts/zharden.sh scripts/build-offline-bundle.sh scripts/device/*.sh; do
             bash -n "$script"

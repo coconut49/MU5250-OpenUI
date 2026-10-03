@@ -1,0 +1,44 @@
+// Configuration observations for one Wi-Fi band (PLAN2 R13).
+//
+// There is no neighbouring-network scan, so nothing here claims interference was measured or
+// excluded; every line is a fact about the configured or the current radio state. An empty result
+// means "nothing to say" and the UI omits the section.
+
+import type { WifiBand } from '../../types'
+import { widthMhz, widthsAgree } from '../../data/wifiWidth'
+import { normalizeConfiguredChannel } from './wifiDraft'
+
+const DFS_5G_CHANNELS = new Set([52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144])
+
+export function getBandInsights(suffix: '2g' | '5g', band: WifiBand): string[] {
+  const insights: string[] = []
+  const configured = normalizeConfiguredChannel(band.configuredChannel)
+  const current = band.actualChannel ?? band.channel
+
+  if (configured === 'auto') {
+    if (current != null) insights.push(`Automatic channel selection is currently using channel ${current}.`)
+  } else {
+    const num = parseInt(configured, 10)
+    if (!Number.isNaN(num)) {
+      if (current != null && num !== current) {
+        insights.push(`Configured channel is ${num}; the radio is currently on channel ${current}.`)
+      }
+      if (suffix === '2g' && ![1, 6, 11].includes(num)) {
+        insights.push(
+          `Channel ${num} overlaps its neighbouring 2.4 GHz channels; 1, 6 and 11 are the non-overlapping set. No scan of nearby networks was run, so interference is neither measured nor ruled out.`,
+        )
+      }
+      if (suffix === '5g' && DFS_5G_CHANNELS.has(num)) {
+        insights.push(`Channel ${num} is a DFS channel: radar detection can force the radio to change channel.`)
+      }
+    }
+  }
+
+  // Compare numeric widths so 'HE80' and '80 MHz' agree; unknown or unparseable widths never warn.
+  if (widthsAgree(band.configuredBandwidth, band.actualBandwidth ?? band.bandwidth) === false) {
+    insights.push(
+      `Configured width is ${widthMhz(band.configuredBandwidth)} MHz; the radio is currently operating at ${widthMhz(band.actualBandwidth ?? band.bandwidth)} MHz. The two can differ temporarily.`,
+    )
+  }
+  return insights
+}

@@ -128,6 +128,17 @@ thermal and data-usage sources. Failed refreshes retain the last successful
 reading and mark it stale. The UI shows source failures and charge-policy
 errors, and warns when its entire dashboard refresh fails.
 
+`data_usage` (in `/api/dashboard` and the `PUT /api/data-usage/reset-day`
+reply) reports counters as numbers, or `null` when the firmware omits or
+garbles one. `reset_day` (1–31) and `reset_enabled` (0/1) come from
+`zwrt_data get_wwandst_clearday`, falling back to the persisted
+`zwrt_data_commit.wwancid1dst` UCI values; each is `null` when neither source
+supplies a valid value. `clear_date_record` (`YYYY/MM/DD`) and
+`next_clear_date` (`YYYYMMDD`) are passed through as the firmware stores them.
+`since_power_on` holds the firmware's `real_*` counters; on HK B04 these reset
+with the data connection, not only at power-on, so the dashboard labels them
+connection counters. Saving a reset day also enables the automatic reset.
+
 Signal and connection loggers share the dashboard's radio source (one-second
 minimum refresh interval). CSV files have an 8 MiB cap per logger, buffered
 writes, a 30-second maximum flush interval and an error field in logger status.

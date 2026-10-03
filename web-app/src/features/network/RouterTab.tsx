@@ -1,10 +1,42 @@
-import { useEffect, useState } from 'react'
+import { useId, useState } from 'react'
 import { api } from '../../data/api'
 import { confirmLan } from '../../data/client'
+import { useResource, type PollResult } from '../../data/poll'
 import type { DnsConfig, LanConfig } from '../../types'
 import { Button, Field, Input, Toggle } from '../../ui/controls'
-import { toast, toastError } from '../../ui/feedback'
-import { Card } from '../../ui/primitives'
+import { confirm, toast, toastError } from '../../ui/feedback'
+import { Card, InlineStatus, Loading, Skeleton } from '../../ui/primitives'
+
+/**
+ * Baseline state of a settings read (R07). While there is no trustworthy baseline the form shows
+ * empty disabled fields (never plausible defaults), the failure and a Retry; a stale baseline stays
+ * editable but is labelled.
+ */
+function BaselineStatus({ what, resource }: { what: string; resource: Pick<PollResult<unknown>, 'status' | 'error' | 'refresh' | 'refreshing'> }) {
+  if (resource.status === 'error') {
+    return (
+      <InlineStatus
+        kind="error"
+        className="mb-3"
+        action={{ label: 'Retry', onClick: resource.refresh, loading: resource.refreshing }}
+      >
+        Could not read the {what}: {resource.error}. Editing is disabled until the current settings load.
+      </InlineStatus>
+    )
+  }
+  if (resource.status === 'stale') {
+    return (
+      <InlineStatus
+        kind="stale"
+        className="mb-3"
+        action={{ label: 'Retry', onClick: resource.refresh, loading: resource.refreshing }}
+      >
+        Showing the last {what} that loaded. The latest read failed: {resource.error}
+      </InlineStatus>
+    )
+  }
+  return null
+}
 
 const DNS_PRESETS: { label: string; v: DnsConfig }[] = [
   {
@@ -22,24 +54,36 @@ const DNS_PRESETS: { label: string; v: DnsConfig }[] = [
 ]
 
 function DnsSection() {
-  const [dns, setDns] = useState<DnsConfig>({ primary: '', secondary: '' })
+  const resource = useResource('router:dns', api.dnsGet)
+  // `draft` is null while the form is pristine (it then mirrors the device); an edit copies the baseline.
+  const [draft, setDraft] = useState<DnsConfig | null>(null)
   const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    api.dnsGet().then(setDns).catch(() => {})
-  }, [])
+  const [saveNote, setSaveNote] = useState('')
+  const known = resource.data != null
+  const dns: DnsConfig = draft ?? resource.data ?? { primary: '', secondary: '' }
+  const edit = (patch: Partial<DnsConfig>) => setDraft({ ...dns, ...patch })
 
   async function save() {
+    if (!known || busy) return
+    const frozen = { ...dns }
     setBusy(true)
+    setSaveNote('')
     try {
       await api.dnsSet({
         dns_mode: 'manual',
-        prefer_dns_manual: dns.primary,
-        standby_dns_manual: dns.secondary,
-        ...(dns.ipv6_primary ? { ipv6_wan_prefer_dns_manual: dns.ipv6_primary } : {}),
-        ...(dns.ipv6_secondary ? { ipv6_wan_standby_dns_manual: dns.ipv6_secondary } : {}),
+        prefer_dns_manual: frozen.primary,
+        standby_dns_manual: frozen.secondary,
+        ...(frozen.ipv6_primary ? { ipv6_wan_prefer_dns_manual: frozen.ipv6_primary } : {}),
+        ...(frozen.ipv6_secondary ? { ipv6_wan_standby_dns_manual: frozen.ipv6_secondary } : {}),
       })
       toast('DNS settings saved')
+      try {
+        resource.mutate(await api.dnsGet())
+        setDraft(null)
+      } catch {
+        // Accepted, but the read-back failed: keep showing what was submitted and say it is unverified.
+        setSaveNote('DNS settings were accepted, but reading them back failed. The values shown are what you submitted and are unverified.')
+      }
     } catch (e) {
       toastError(e, 'Failed to save DNS')
     } finally {
@@ -47,29 +91,43 @@ function DnsSection() {
     }
   }
 
+  if (!resource.data && resource.status === 'loading') {
+    return (
+      <Loading label="Loading DNS settings">
+        <Skeleton className="h-40" />
+      </Loading>
+    )
+  }
+
   return (
     <Card title="DNS servers">
+      <BaselineStatus what="DNS settings" resource={resource} />
+      {saveNote && (
+        <InlineStatus kind="warn" className="mb-3">
+          {saveNote}
+        </InlineStatus>
+      )}
       <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-2">
         <Field label="Primary DNS (IPv4)">
-          <Input value={dns.primary} onChange={(e) => setDns((d) => ({ ...d, primary: e.target.value }))} placeholder="1.1.1.1" inputMode="numeric" />
+          <Input disabled={!known} value={dns.primary} onChange={(e) => edit({ primary: e.target.value })} placeholder="1.1.1.1" inputMode="numeric" />
         </Field>
         <Field label="Secondary DNS (IPv4)">
-          <Input value={dns.secondary} onChange={(e) => setDns((d) => ({ ...d, secondary: e.target.value }))} placeholder="1.0.0.1" inputMode="numeric" />
+          <Input disabled={!known} value={dns.secondary} onChange={(e) => edit({ secondary: e.target.value })} placeholder="1.0.0.1" inputMode="numeric" />
         </Field>
         <Field label="Primary DNS (IPv6)">
-          <Input value={dns.ipv6_primary ?? ''} onChange={(e) => setDns((d) => ({ ...d, ipv6_primary: e.target.value }))} placeholder="2606:4700:4700::1111" />
+          <Input disabled={!known} value={dns.ipv6_primary ?? ''} onChange={(e) => edit({ ipv6_primary: e.target.value })} placeholder="2606:4700:4700::1111" />
         </Field>
         <Field label="Secondary DNS (IPv6)">
-          <Input value={dns.ipv6_secondary ?? ''} onChange={(e) => setDns((d) => ({ ...d, ipv6_secondary: e.target.value }))} placeholder="2001:4860:4860::8888" />
+          <Input disabled={!known} value={dns.ipv6_secondary ?? ''} onChange={(e) => edit({ ipv6_secondary: e.target.value })} placeholder="2001:4860:4860::8888" />
         </Field>
       </div>
       <div className="mt-3.5 flex flex-wrap items-center gap-2">
-        <Button variant="primary" onClick={save} loading={busy}>
-          Apply
+        <Button variant="primary" onClick={save} loading={busy} disabled={!known}>
+          Apply DNS
         </Button>
-        <div className="flex gap-1.5">
+        <div className="flex flex-wrap gap-1.5" role="group" aria-label="DNS presets">
           {DNS_PRESETS.map((p) => (
-            <Button key={p.label} variant="ghost" size="sm" onClick={() => setDns(p.v)}>
+            <Button key={p.label} variant="ghost" size="sm" disabled={!known} aria-label={`Fill ${p.label} DNS servers`} onClick={() => setDraft(p.v)}>
               {p.label}
             </Button>
           ))}
@@ -80,43 +138,59 @@ function DnsSection() {
 }
 
 function LanSection() {
-  const [lan, setLan] = useState<LanConfig>({
-    ipaddr: '',
-    netmask: '',
-    dhcp_enabled: true,
-    dhcp_start: '',
-    dhcp_end: '',
-    lease_seconds: 86400,
-  })
+  const resource = useResource('router:lan', api.lanGet)
+  const [draft, setDraft] = useState<LanConfig | null>(null)
   const [busy, setBusy] = useState(false)
   const [transition, setTransition] = useState('')
-
-  useEffect(() => {
-    api.lanGet().then(setLan).catch(() => {})
-  }, [])
+  const dhcpId = useId()
+  const known = resource.data != null
+  const lan: LanConfig = draft ?? resource.data ?? { ipaddr: '', netmask: '', dhcp_enabled: false, dhcp_start: '', dhcp_end: '', lease_seconds: 0 }
+  const edit = (patch: Partial<LanConfig>) => setDraft({ ...lan, ...patch })
 
   async function save() {
+    if (!known || busy) return
+    const frozen = { ...lan }
+    const before = resource.data
+    const moves = before != null && (frozen.ipaddr !== before.ipaddr || frozen.netmask !== before.netmask)
     setBusy(true)
+    const ok = await confirm({
+      kind: 'connection',
+      title: moves ? `Move the router to ${frozen.ipaddr}?` : 'Apply LAN settings?',
+      body: 'The router restarts its LAN and DHCP service to apply this.',
+      details: [
+        { label: 'Router address', value: before && before.ipaddr !== frozen.ipaddr ? `${before.ipaddr} → ${frozen.ipaddr}` : frozen.ipaddr },
+        { label: 'Netmask', value: frozen.netmask },
+        { label: 'DHCP', value: frozen.dhcp_enabled ? `${frozen.dhcp_start} – ${frozen.dhcp_end}` : 'Off' },
+      ],
+      consequence: moves
+        ? 'Every device on Wi-Fi and USB-C briefly loses its LAN connection, including this dashboard, which moves to the new address. Mobile data is not changed.'
+        : 'Connected devices may briefly lose their LAN connection and renew their addresses. Mobile data is not changed.',
+      recovery: 'If the new address cannot be confirmed within about two minutes, the previous LAN settings return automatically.',
+    })
+    if (!ok) {
+      setBusy(false)
+      return
+    }
     try {
       const result = await api.lanSet({
-        ipaddr: lan.ipaddr,
-        netmask: lan.netmask,
-        dhcp_enabled: lan.dhcp_enabled,
-        dhcp_start: lan.dhcp_start,
-        dhcp_end: lan.dhcp_end,
-        lease_seconds: lan.lease_seconds,
+        ipaddr: frozen.ipaddr,
+        netmask: frozen.netmask,
+        dhcp_enabled: frozen.dhcp_enabled,
+        dhcp_start: frozen.dhcp_start,
+        dhcp_end: frozen.dhcp_end,
+        lease_seconds: frozen.lease_seconds,
       })
       if (result.changed) {
-        if (result.reconnect_ip !== lan.ipaddr || typeof result.confirmation_token !== 'string') {
+        if (result.reconnect_ip !== frozen.ipaddr || typeof result.confirmation_token !== 'string') {
           throw new Error('Invalid LAN transition response; previous settings will be restored automatically')
         }
-        setTransition(`Reconnecting to ${lan.ipaddr}. Rejoin Wi-Fi if needed. Previous settings return automatically if confirmation fails.`)
+        setTransition(`Reconnecting to ${frozen.ipaddr}. Rejoin Wi-Fi if needed. Previous settings return automatically if confirmation fails.`)
         const deadline = Date.now() + 90_000
         let confirmed = false
         while (Date.now() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 2000))
           try {
-            await confirmLan(lan.ipaddr, result.confirmation_token)
+            await confirmLan(frozen.ipaddr, result.confirmation_token)
             confirmed = true
             break
           } catch { /* The address may still be changing; retry within the recovery window. */ }
@@ -125,14 +199,20 @@ function LanSection() {
           throw new Error('Could not confirm the new address. Wait up to two minutes from Apply for the previous LAN settings to return, then reconnect.')
         }
         setTransition('LAN settings confirmed. Opening the dashboard at its new address…')
-        if (window.location.hostname !== lan.ipaddr) {
+        if (window.location.hostname !== frozen.ipaddr) {
           const next = new URL(window.location.href)
-          next.hostname = lan.ipaddr
+          next.hostname = frozen.ipaddr
           // Session storage belongs to the old origin; sign in again at the new address.
           window.location.assign(next.toString())
         }
       }
       toast('LAN settings saved and confirmed')
+      try {
+        resource.mutate(await api.lanGet())
+        setDraft(null)
+      } catch {
+        setTransition('LAN settings were accepted, but reading them back failed. The values shown are what you submitted and are unverified.')
+      }
     } catch (e) {
       setTransition(e instanceof Error ? e.message : 'LAN change failed')
       toastError(e, 'Failed to save LAN settings')
@@ -141,44 +221,53 @@ function LanSection() {
     }
   }
 
+  if (!resource.data && resource.status === 'loading') {
+    return (
+      <Loading label="Loading LAN settings">
+        <Skeleton className="h-56" />
+      </Loading>
+    )
+  }
+
   return (
     <Card title="LAN / DHCP">
+      <BaselineStatus what="LAN settings" resource={resource} />
       <p className="mb-3 text-xs text-ink3" role="status">{transition || 'Changes must reconnect and confirm within two minutes; otherwise the previous settings are restored.'}</p>
       <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-2">
         <Field label="LAN IP">
-          <Input value={lan.ipaddr} onChange={(e) => setLan((l) => ({ ...l, ipaddr: e.target.value }))} inputMode="numeric" />
+          <Input disabled={!known} value={lan.ipaddr} onChange={(e) => edit({ ipaddr: e.target.value })} inputMode="numeric" />
         </Field>
         <Field label="Netmask">
-          <Input value={lan.netmask} onChange={(e) => setLan((l) => ({ ...l, netmask: e.target.value }))} inputMode="numeric" />
+          <Input disabled={!known} value={lan.netmask} onChange={(e) => edit({ netmask: e.target.value })} inputMode="numeric" />
         </Field>
         <Field label="DHCP start">
-          <Input disabled={!lan.dhcp_enabled} value={lan.dhcp_start} onChange={(e) => setLan((l) => ({ ...l, dhcp_start: e.target.value }))} inputMode="numeric" />
+          <Input disabled={!known || !lan.dhcp_enabled} value={lan.dhcp_start} onChange={(e) => edit({ dhcp_start: e.target.value })} inputMode="numeric" />
         </Field>
         <Field label="DHCP end">
-          <Input disabled={!lan.dhcp_enabled} value={lan.dhcp_end} onChange={(e) => setLan((l) => ({ ...l, dhcp_end: e.target.value }))} inputMode="numeric" />
+          <Input disabled={!known || !lan.dhcp_enabled} value={lan.dhcp_end} onChange={(e) => edit({ dhcp_end: e.target.value })} inputMode="numeric" />
         </Field>
         <Field label="Lease time (hours)" hint="The firmware stores this value in seconds.">
           <Input
             type="number"
             min={1}
             max={168}
-            disabled={!lan.dhcp_enabled}
-            value={lan.lease_seconds / 3600}
-            onChange={(e) => setLan((l) => ({ ...l, lease_seconds: Math.round(Number(e.target.value) * 3600) }))}
+            disabled={!known || !lan.dhcp_enabled}
+            value={known ? lan.lease_seconds / 3600 : ''}
+            onChange={(e) => edit({ lease_seconds: Math.round(Number(e.target.value) * 3600) })}
             inputMode="numeric"
           />
         </Field>
       </div>
-      <div className="mt-3 flex items-center justify-between rounded-ctl bg-surface2/60 px-3 py-2.5">
-        <div>
-          <p className="text-body font-semibold text-ink">DHCP server</p>
+      <div className="mt-3 flex items-center justify-between gap-3 rounded-ctl bg-surface2/60 px-3 py-2.5">
+        <div className="min-w-0">
+          <p id={dhcpId} className="text-body font-semibold text-ink">DHCP server</p>
           <p className="text-caption text-ink3">Assign addresses to LAN and Wi-Fi clients</p>
         </div>
-        <Toggle checked={lan.dhcp_enabled} onChange={(dhcp_enabled) => setLan((l) => ({ ...l, dhcp_enabled }))} label="DHCP server" />
+        <Toggle checked={lan.dhcp_enabled} disabled={!known} onChange={(dhcp_enabled) => edit({ dhcp_enabled })} labelledBy={dhcpId} />
       </div>
       <div className="mt-3.5">
-        <Button variant="primary" onClick={save} loading={busy}>
-          Apply
+        <Button variant="primary" onClick={save} loading={busy} disabled={!known}>
+          Apply LAN
         </Button>
       </div>
     </Card>

@@ -1,7 +1,19 @@
 import { useHome } from '../../app/HomeContext'
-import { formatBandwidthMHz, formatBytes, formatSpeed, formatUptime, modemMode, qualityLabel, qualityText, rsrpQuality, sumBandwidthMHz } from '../../format'
+import { formatBandwidthMHz, formatBytes, formatSpeed, formatUptime, modemMode } from '../../format'
 import { IBolt, IDownload, IUpload } from '../../icons'
-import { Card, Chip, Meter, Row, SignalBars, Skeleton } from '../../ui/primitives'
+import { Card, Chip, Meter, Row, SignalBars, Skeleton, Unavailable } from '../../ui/primitives'
+import { MetricValue } from '../signal/MetricValue'
+import { Tip } from '../signal/Tip'
+import {
+  METRIC_HELP,
+  METRIC_LABEL,
+  bandwidthSummary,
+  barsText,
+  carrierCounts,
+  homeUsageRows,
+  metricView,
+  servingView,
+} from '../signal/telemetryView'
 import type { BatteryInfo } from '../../types'
 
 function PageSkeleton() {
@@ -33,14 +45,20 @@ export default function HomePage() {
   const mem = data?.memory ?? null
   const usage = data?.usage ?? null
 
-  const primary = signal?.lte_carriers?.[0] || signal?.nr_carriers?.[0]
-  const pccRsrp = primary?.rsrp ?? signal?.rsrp
-  const quality = rsrpQuality(pccRsrp)
+  // Mapper-validated serving carrier (SA -> NR PCC, LTE/NSA -> LTE anchor PCC); never a raw field.
+  const serving = servingView(signal)
+  const primary = serving.carrier
+  const rsrp = metricView('rsrp', primary?.rsrp)
   const mode = modemMode(signal?.type)
-  const lteBw = signal ? sumBandwidthMHz(signal.lte_carriers) : 0
-  const nrBw = signal ? sumBandwidthMHz(signal.nr_carriers) : 0
+  const lte = signal ? carrierCounts(signal.lte_carriers) : null
+  const nr = signal ? carrierCounts(signal.nr_carriers) : null
+  const lteBw = bandwidthSummary(signal?.lte_carriers ?? []).reportedMHz
+  const nrBw = bandwidthSummary(signal?.nr_carriers ?? []).reportedMHz
   const totalBw = lteBw + nrBw
-  const carrierCount = (signal?.lte_carriers.length ?? 0) + (signal?.nr_carriers.length ?? 0)
+  const reported = (lte?.reported ?? 0) + (nr?.reported ?? 0)
+  const active = (lte?.active ?? 0) + (nr?.active ?? 0)
+  const idle = (lte?.idle ?? 0) + (nr?.idle ?? 0)
+  const bars = barsText(signal?.signal_bars)
 
   return (
     <div className="space-y-4">
@@ -63,20 +81,52 @@ export default function HomePage() {
               <div className="min-w-0">
                 <p className="label">Signal · RSRP</p>
                 <div className="mt-2 flex items-baseline gap-2">
-                  <span className={`tnum font-mono text-5xl font-medium leading-none tracking-[-0.03em] ${qualityText(quality)}`}>
-                    {pccRsrp != null ? pccRsrp : '\u2014'}
+                  <span
+                    data-testid="home-rsrp"
+                    data-level={rsrp.level}
+                    className={`tnum font-mono text-5xl font-medium leading-none tracking-[-0.03em] ${rsrp.className}`}
+                  >
+                    {rsrp.text ?? <Unavailable label="RSRP unavailable" />}
                   </span>
-                  <span className="font-display text-sm font-medium text-ink2">dBm</span>
+                  {rsrp.text !== null && <span className="font-display text-sm font-medium text-ink2">dBm</span>}
                 </div>
-                <p className={`mt-1.5 text-body font-semibold ${qualityText(quality)}`}>{qualityLabel(quality)}</p>
+                <p data-testid="home-rsrp-word" className={`mt-1.5 text-body font-semibold ${rsrp.className}`}>
+                  {rsrp.text === null ? 'No serving measurement' : rsrp.word}
+                </p>
               </div>
-              <SignalBars bars={signal?.signal_bars} large />
+              {bars === null ? (
+                <p className="text-caption text-ink3">
+                  Bars <Unavailable label="Signal bars unavailable" />
+                </p>
+              ) : (
+                <SignalBars bars={signal?.signal_bars} large />
+              )}
             </div>
             <div className="tnum mt-4 flex flex-wrap items-center gap-x-3 gap-y-1.5 font-mono text-meta text-ink2">
-              {primary?.band && <Chip tone={primary.band.startsWith('n') ? 'nr' : 'lte'}>{primary.band}</Chip>}
-              {primary?.pci != null && primary.pci > 0 && <span>PCI {primary.pci}</span>}
-              <span>{signal?.signal_bars ?? 0}/5 bars</span>
+              {serving.available && primary ? (
+                <Chip tone={serving.rat?.startsWith('LTE') ? 'lte' : 'nr'}>{serving.label}</Chip>
+              ) : (
+                <span className="text-ink3">
+                  Serving cell <Unavailable label="No serving carrier reported" />
+                </span>
+              )}
+              {serving.pci !== undefined && <span>PCI {serving.pci}</span>}
+              <span>{bars ?? 'Bars unavailable'}</span>
             </div>
+            <dl className="mt-3 grid grid-cols-3 gap-x-3 gap-y-1.5 border-t border-line/10 pt-3 font-mono text-meta">
+              {(['rsrq', 'sinr', 'rssi'] as const).map((m) => (
+                <div key={m} className="min-w-0">
+                  <dt className="label">
+                    <Tip text={METRIC_HELP[m]} className="label">
+                      {METRIC_LABEL[m]}
+                    </Tip>
+                  </dt>
+                  <dd className="tnum mt-0.5 font-medium">
+                    <MetricValue metric={m} value={primary?.[m]} />
+                  </dd>
+                </div>
+              ))}
+            </dl>
           </div>
 
           <div className="col-span-6 bg-band p-4 sm:col-span-2 xl:col-span-1">
@@ -100,13 +150,19 @@ export default function HomePage() {
             <p className="label">Mode</p>
             <p className="tnum mt-2 font-mono text-2xl font-medium leading-none text-ink">{mode}</p>
             <p className="mt-1.5 text-meta text-ink2">
-              {carrierCount} carrier{carrierCount !== 1 ? 's' : ''}
+              {reported} carrier{reported !== 1 ? 's' : ''} reported
             </p>
+            {reported > 0 && (
+              <p className="text-caption text-ink3">
+                {active} active{idle > 0 ? ` · ${idle} idle` : ''}
+              </p>
+            )}
             <div className="mt-3 flex flex-wrap gap-1">
               {nrBw > 0 && <Chip tone="nr">NR {formatBandwidthMHz(nrBw)}</Chip>}
               {lteBw > 0 && <Chip tone="lte">LTE {formatBandwidthMHz(lteBw)}</Chip>}
-              {totalBw <= 0 && <span className="text-caption text-ink3">No bandwidth</span>}
+              {totalBw <= 0 && <span className="text-caption text-ink3">No bandwidth reported</span>}
             </div>
+            {totalBw > 0 && <p className="mt-1 text-caption text-ink3">Sum of reported carriers</p>}
           </div>
 
           <div className="col-span-3 bg-band p-4 sm:col-span-2 xl:col-span-1">
@@ -127,7 +183,7 @@ export default function HomePage() {
 
       {/* Radio details */}
       {signal && (signal.lte_carriers.length > 0 || signal.nr_carriers.length > 0) && (
-        <Card title="Carriers">
+        <Card title="Reported carriers">
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div>
               <p className="label mb-1.5 text-accent">LTE</p>
@@ -137,11 +193,12 @@ export default function HomePage() {
                     <Chip key={i} tone="lte">
                       {c.label} · {c.band}
                       {c.rsrp != null ? ` · ${c.rsrp} dBm` : ''}
+                      {c.active === false ? ' · idle' : ''}
                     </Chip>
                   ))}
                 </div>
               ) : (
-                <p className="text-body text-ink3">No active LTE carrier</p>
+                <p className="text-body text-ink3">No LTE carrier reported</p>
               )}
             </div>
             <div>
@@ -154,11 +211,12 @@ export default function HomePage() {
                     <Chip key={i} tone="nr">
                       {c.label} · {c.band}
                       {c.rsrp != null ? ` · ${c.rsrp} dBm` : ''}
+                      {c.active === false ? ' · idle' : ''}
                     </Chip>
                   ))}
                 </div>
               ) : (
-                <p className="text-body text-ink3">No active NR carrier</p>
+                <p className="text-body text-ink3">No NR carrier reported</p>
               )}
             </div>
           </div>
@@ -203,19 +261,18 @@ export default function HomePage() {
         <Card title="Data usage">
           {usage ? (
             <div className="space-y-2.5">
-              {[
-                { label: 'Today', period: usage.day },
-                { label: 'This month', period: usage.month },
-                { label: 'Total', period: usage.total },
-              ].map(({ label, period }) => (
-                <div key={label}>
+              {homeUsageRows(usage).map(({ label, rx, tx, total }) => (
+                <div key={label} data-usage={label}>
                   <p className="label">{label}</p>
-                  <div className="tnum font-mono mt-0.5 flex gap-3 text-body font-medium">
+                  <div className="tnum font-mono mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-body font-medium">
                     <span className="flex items-center gap-1 text-ok">
-                      <IDownload size={12} /> {formatBytes(period.rx_bytes)}
+                      <IDownload size={12} /> <Bytes value={rx} />
                     </span>
                     <span className="flex items-center gap-1 text-accent">
-                      <IUpload size={12} /> {formatBytes(period.tx_bytes)}
+                      <IUpload size={12} /> <Bytes value={tx} />
+                    </span>
+                    <span className="text-ink2">
+                      <Bytes value={total} /> <span className="font-sans text-meta font-normal text-ink3">total</span>
                     </span>
                   </div>
                 </div>
@@ -228,6 +285,11 @@ export default function HomePage() {
       </div>
     </div>
   )
+}
+
+/** Measured bytes (0 stays "0 B"); unknown is an em dash with an Unavailable label. */
+function Bytes({ value }: { value: number | null }) {
+  return value === null ? <Unavailable /> : <>{formatBytes(value)}</>
 }
 
 function batteryState(battery: BatteryInfo | null | undefined): string {

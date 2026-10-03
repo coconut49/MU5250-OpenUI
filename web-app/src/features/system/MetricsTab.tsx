@@ -1,12 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { api } from '../../data/api'
 import { usePoll } from '../../data/poll'
 import { tempColorClass } from '../../format'
 import type { BatteryBspInfo, BatteryDetail, ChargeControlState, CpuInfo, MemInfo, ThermalAll } from '../../types'
 import { formatBytes } from '../../format'
-import { Button, Toggle } from '../../ui/controls'
-import { toastError } from '../../ui/feedback'
-import { Card, Meter, Skeleton } from '../../ui/primitives'
+import { Button, Field, Toggle } from '../../ui/controls'
+import { Card, InlineStatus, Meter, Skeleton } from '../../ui/primitives'
+import { LIMIT_MAX, LIMIT_MIN, LIMIT_STEP, limitToApply } from './chargeLimit'
 
 interface MetricsData {
   thermal: ThermalAll | null
@@ -41,34 +41,57 @@ function ThermalBar({ label, value }: { label: string; value?: number | null }) 
 // ── Charge control ────────────────────────────────────────────────────────────
 
 function ChargeControlCard() {
-  const { data: cc, mutate } = usePoll('charge-control', api.chargeControl, 10000)
+  const { data: cc, error, status, refresh, mutate } = usePoll('charge-control', api.chargeControl, 10000)
   const [busy, setBusy] = useState(false)
-  const [limit, setLimit] = useState<number | null>(null)
-  const [dragging, setDragging] = useState(false)
-
-  useEffect(() => {
-    if (!dragging && cc) setLimit(cc.charge_limit)
-  }, [cc, dragging])
+  const [failure, setFailure] = useState<string | null>(null)
+  // Local edit of the limit. `null` = pristine: the slider shows the device's
+  // value, and polls can never overwrite a value the user is still choosing.
+  const [draft, setDraft] = useState<number | null>(null)
 
   async function apply(body: Partial<ChargeControlState>) {
+    if (busy) return
     setBusy(true)
+    setFailure(null)
     try {
       // The PUT returns the authoritative new state — publish it rather than
       // spending a second request re-reading what we were just handed.
       mutate(await api.chargeControlSet(body))
+      if ('charge_limit' in body) setDraft(null)
     } catch (e) {
-      toastError(e, 'Charge control failed')
+      setFailure(e instanceof Error ? e.message : 'Charge control failed')
     } finally {
       setBusy(false)
     }
   }
 
-  if (!cc) return null
+  if (!cc) {
+    return (
+      <Card title="Charge control">
+        {status === 'error' ? (
+          <InlineStatus kind="error" action={{ label: 'Retry', onClick: refresh }}>
+            Charge control unavailable: {error}
+          </InlineStatus>
+        ) : (
+          <Skeleton className="h-32" />
+        )}
+      </Card>
+    )
+  }
+
+  const shown = draft ?? cc.charge_limit
+  const pending = limitToApply(draft, cc.charge_limit)
+  const limitEditable = cc.charge_limit_enabled && cc.battery_available
 
   return (
     <Card title="Charge control">
       <div className="space-y-3">
-        {cc.last_error && <p role="alert" className="text-meta text-danger">{cc.last_error}</p>}
+        {status === 'stale' && (
+          <InlineStatus kind="stale" action={{ label: 'Retry', onClick: refresh }}>
+            Showing the last reading; refresh failed: {error}
+          </InlineStatus>
+        )}
+        {cc.last_error && <InlineStatus kind="error">{cc.last_error}</InlineStatus>}
+        {failure && <InlineStatus kind="error">Change not applied: {failure}</InlineStatus>}
         <div className="flex items-center justify-between gap-2">
           <div className="min-w-0">
             <p className="text-body font-medium text-ink">Charging</p>
@@ -80,7 +103,7 @@ function ChargeControlCard() {
             size="sm"
             variant={cc.charging_stopped ? 'primary' : 'outline'}
             loading={busy}
-            disabled={!cc.charger_available}
+            disabled={!cc.charger_available || cc.charging_stopped == null}
             onClick={() => apply({ charging_stopped: !cc.charging_stopped })}
           >
             {cc.charging_stopped ? 'Resume charging' : 'Stop charging'}
@@ -90,7 +113,7 @@ function ChargeControlCard() {
         <div className="border-t border-line/8 pt-3">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-body font-medium text-ink">Charge limit</p>
+              <p id="charge-limit-enforcer" className="text-body font-medium text-ink">Charge limit</p>
               <p className="text-meta text-ink2">
                 Stop at limit, resume {cc.hysteresis}% below
               </p>
@@ -99,35 +122,59 @@ function ChargeControlCard() {
               checked={cc.charge_limit_enabled}
               disabled={busy || !cc.battery_available}
               onChange={(v) => apply({ charge_limit_enabled: v })}
-              label="Charge limit enforcer"
+              labelledBy="charge-limit-enforcer"
             />
           </div>
-          <div className="mt-2 flex items-center gap-3">
-            <input
-              type="range"
-              min={50}
-              max={100}
-              step={5}
-              value={limit ?? cc.charge_limit}
-              disabled={busy || !cc.charge_limit_enabled || !cc.battery_available}
-              onChange={(e) => setLimit(Number(e.target.value))}
-              onPointerDown={() => setDragging(true)}
-              onPointerUp={(e) => {
-                setDragging(false)
-                apply({ charge_limit: Number(e.currentTarget.value) })
-              }}
-              onKeyUp={(e) => apply({ charge_limit: Number(e.currentTarget.value) })}
-              className="w-full accent-[rgb(var(--accent))] disabled:opacity-40"
-            />
-            <span className="tnum font-mono w-12 text-right text-body font-semibold text-ink">
-              {limit ?? cc.charge_limit}%
-            </span>
+          <div className="mt-3">
+            <Field label="Stop charging at" hint={pending != null ? `Not applied yet. The device limit is ${cc.charge_limit}%.` : undefined}>
+              {(ids) => (
+                <div className="flex items-center gap-3">
+                  <input
+                    id={ids.id}
+                    aria-describedby={ids.describedBy}
+                    type="range"
+                    min={LIMIT_MIN}
+                    max={LIMIT_MAX}
+                    step={LIMIT_STEP}
+                    value={shown}
+                    aria-valuetext={`${shown}%`}
+                    disabled={busy || !limitEditable}
+                    onChange={(e) => setDraft(Number(e.target.value))}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape' && draft != null) {
+                        e.preventDefault()
+                        setDraft(null)
+                      }
+                    }}
+                    className="w-full accent-[rgb(var(--accent))] disabled:opacity-40"
+                  />
+                  <span className="tnum w-12 text-right font-mono text-body font-semibold text-ink" aria-hidden="true">
+                    {shown}%
+                  </span>
+                </div>
+              )}
+            </Field>
+            {draft != null && (
+              <div className="mt-2 flex justify-end gap-2">
+                <Button size="sm" variant="ghost" disabled={busy} onClick={() => setDraft(null)}>
+                  Cancel
+                </Button>
+                <Button
+                  size="sm"
+                  variant="primary"
+                  loading={busy}
+                  disabled={pending == null || !limitEditable}
+                  onClick={() => pending != null && apply({ charge_limit: pending })}
+                >
+                  Apply limit
+                </Button>
+              </div>
+            )}
           </div>
         </div>
 
         <p className="text-caption leading-snug text-ink3">
-          Firmware note: the charger switch is inverted (enable = stop). Charging auto-resumes when the
-          charger is unplugged or the limit is disabled.
+          Charging resumes automatically when the charger is unplugged or the limit is turned off.
         </p>
         {!cc.available && <p className="text-meta font-medium text-warn">Battery and charger hardware data are unavailable; controls are disabled.</p>}
       </div>

@@ -1,78 +1,121 @@
+import { Fragment, type ReactNode } from 'react'
 import { api } from '../../data/api'
 import { usePoll } from '../../data/poll'
-import type { Client, UsbStatus } from '../../types'
+import type { Client } from '../../types'
 import { ICable, ILaptop, IRefresh, IUsb, IWifi } from '../../icons'
 import { Button } from '../../ui/controls'
-import { Card, Chip, Empty, Skeleton } from '../../ui/primitives'
-
-function formatLinkMbps(value?: number) {
-  if (value == null || value <= 0) return '\u2014'
-  return `${Math.round(value)} Mbps`
-}
-
-function formatBitrate(mbps?: number) {
-  if (mbps == null || mbps <= 0) return null
-  return mbps >= 1000 ? `${mbps / 1000} Gbit/s` : `${mbps} Mbit/s`
-}
-
-function formatWifiLink(client: Client) {
-  const parts: string[] = []
-  if (client.tx_bitrate_mbps != null) parts.push(`TX ${client.tx_bitrate_mbps.toFixed(0)}`)
-  if (client.rx_bitrate_mbps != null) parts.push(`RX ${client.rx_bitrate_mbps.toFixed(0)}`)
-  return parts.length > 0 ? `${parts.join(' / ')} Mbps` : '\u2014'
-}
-
-function groupClients(clients: Client[]) {
-  return {
-    wifi: clients.filter((c) => c.medium === 'wifi'),
-    usb: clients.filter((c) => c.medium === 'usb-c'),
-    ethernet: clients.filter((c) => c.medium === 'ethernet'),
-    other: clients.filter((c) => !c.medium || c.medium === 'wired'),
-  }
-}
+import { Card, Chip, Empty, InlineStatus, Loading, Skeleton, Unavailable } from '../../ui/primitives'
+import {
+  clientFields,
+  formatBitrate,
+  formatLinkMbps,
+  formatWifiLink,
+  groupClients,
+  type GroupedClients,
+} from './clientsView'
 
 const TH_CLS = 'pb-1.5 pr-4 font-semibold'
 const TD_CLS = 'py-2 pr-4'
+const MONO_TD = `${TD_CLS} tnum font-mono text-meta text-ink2`
+
+const Value = ({ v }: { v: string | undefined }) => (v ? <>{v}</> : <Unavailable />)
+const hostname = (c: Client) => c.hostname || <Unavailable label="No hostname" />
+
+/** Below `sm`: one stacked row per client with every field the desktop table has (U07). */
+function StackedClients({
+  group,
+  items,
+  badge,
+}: {
+  group: keyof GroupedClients
+  items: Client[]
+  badge?: (c: Client) => ReactNode
+}) {
+  return (
+    <ul className="divide-y divide-line/6 px-4 sm:hidden">
+      {items.map((c) => (
+        <li key={c.mac} className="py-2.5">
+          <div className="flex items-start justify-between gap-2">
+            <span className="min-w-0 break-words text-body font-medium text-ink">{hostname(c)}</span>
+            {badge && <span className="shrink-0">{badge(c)}</span>}
+          </div>
+          <dl className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-meta">
+            {clientFields(group, c).map((f) => (
+              <Fragment key={f.label}>
+                <dt className="text-ink3">{f.label}</dt>
+                <dd className={`min-w-0 break-all ${f.mono ? 'tnum font-mono' : ''} text-ink2`}>
+                  <Value v={f.value} />
+                </dd>
+              </Fragment>
+            ))}
+          </dl>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+const bandChip = (c: Client) => <Chip tone={c.wifi_band === '5 GHz' ? 'accent' : 'ok'}>{c.wifi_band ?? 'Wi-Fi'}</Chip>
 
 export default function ClientsTab() {
-  // Clients is an expensive endpoint (iw station dump + bridge fdb + arp) —
-  // poll slowly and offer a manual refresh instead.
-  const { data, refreshing, refresh } = usePoll(
-    'clients',
-    async () => {
-      const [clients, usb] = await Promise.all([api.clients(), api.usbStatus().catch(() => null)])
-      return { clients: clients ?? [], usb }
-    },
-    15000,
-  )
+  // Clients is an expensive endpoint (iw station dump + bridge fdb + arp): poll slowly and offer a
+  // manual refresh. The USB link comes from its own source so one failing does not hide the other.
+  const clientsPoll = usePoll('network:clients', api.clients, 15000)
+  const usbPoll = usePoll('network:usb-link', api.usbStatus, 15000)
 
-  if (!data) {
+  const refreshAll = () => {
+    clientsPoll.refresh()
+    usbPoll.refresh()
+  }
+
+  if (!clientsPoll.data) {
+    if (clientsPoll.status === 'error') {
+      return (
+        <InlineStatus
+          kind="error"
+          action={{ label: 'Retry', onClick: refreshAll, loading: clientsPoll.refreshing }}
+        >
+          Could not read the connected clients: {clientsPoll.error}
+        </InlineStatus>
+      )
+    }
     return (
-      <div className="space-y-3">
+      <Loading label="Loading clients" className="space-y-3">
         <Skeleton className="h-20" />
         <Skeleton className="h-56" />
-      </div>
+      </Loading>
     )
   }
 
-  const { clients, usb } = data as { clients: Client[]; usb: UsbStatus | null }
+  const clients = clientsPoll.data
   const grouped = groupClients(clients)
-  const usbLink = usb?.link
+  const usbLink = usbPoll.data?.link
   const usbNegotiatedRate = formatBitrate(usbLink?.negotiated_mbps)
   const usbMaxRate = formatBitrate(usbLink?.max_mbps)
+  const usbFailed = usbPoll.error != null
+  const staleClients = clientsPoll.status === 'stale'
 
   return (
     <div className="space-y-3">
       <Card
         title={`Connected clients (${clients.length})`}
         action={
-          <Button size="sm" variant="ghost" onClick={refresh} loading={refreshing}>
+          <Button size="sm" variant="ghost" onClick={refreshAll} loading={clientsPoll.refreshing || usbPoll.refreshing}>
             <IRefresh size={13} /> Refresh
           </Button>
         }
       >
+        {staleClients && (
+          <InlineStatus
+            kind="stale"
+            className="mb-3"
+            action={{ label: 'Retry', onClick: clientsPoll.refresh, loading: clientsPoll.refreshing }}
+          >
+            Showing the last client list that loaded. The latest refresh failed: {clientsPoll.error}
+          </InlineStatus>
+        )}
         {clients.length === 0 ? (
-          <Empty icon={<ILaptop size={28} />} title="No clients connected" />
+          clientsPoll.status === 'ready' && <Empty icon={<ILaptop size={28} />} title="No clients connected" />
         ) : (
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             {[
@@ -95,23 +138,7 @@ export default function ClientsTab() {
 
       {grouped.wifi.length > 0 && (
         <Card title={`Wi-Fi (${grouped.wifi.length})`} pad={false}>
-          {/* Mobile: one row per client instead of a six-column table */}
-          <ul className="divide-y divide-line/6 px-4 sm:hidden">
-            {grouped.wifi.map((c) => (
-              <li key={c.mac} className="py-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-body font-medium text-ink">{c.hostname || '—'}</span>
-                  <Chip tone={c.wifi_band === '5 GHz' ? 'accent' : 'ok'}>{c.wifi_band ?? 'Wi-Fi'}</Chip>
-                </div>
-                <div className="tnum font-mono mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-meta text-ink2">
-                  <span className="font-mono">{c.ip ?? '—'}</span>
-                  <span>{c.signal_dbm != null ? `${c.signal_dbm} dBm` : '—'}</span>
-                  <span>{formatWifiLink(c)}</span>
-                </div>
-                <p className="tnum mt-0.5 font-mono text-caption text-ink3">{c.mac}</p>
-              </li>
-            ))}
-          </ul>
+          <StackedClients group="wifi" items={grouped.wifi} badge={bandChip} />
           <div className="hidden overflow-x-auto px-4 pb-3 sm:block">
             <table className="w-full text-body">
               <thead>
@@ -127,15 +154,17 @@ export default function ClientsTab() {
               <tbody>
                 {grouped.wifi.map((c) => (
                   <tr key={c.mac} className="border-b border-line/6 last:border-0">
-                    <td className={`${TD_CLS} font-medium text-ink`}>{c.hostname || '\u2014'}</td>
-                    <td className={`${TD_CLS} tnum font-mono text-meta text-ink2`}>{c.ip ?? '\u2014'}</td>
-                    <td className={TD_CLS}>
-                      <Chip tone={c.wifi_band === '5 GHz' ? 'accent' : 'ok'}>{c.wifi_band ?? 'Wi-Fi'}</Chip>
+                    <td className={`${TD_CLS} font-medium text-ink`}>{hostname(c)}</td>
+                    <td className={MONO_TD}>
+                      <Value v={c.ip} />
+                    </td>
+                    <td className={TD_CLS}>{bandChip(c)}</td>
+                    <td className={`${TD_CLS} tnum font-mono text-ink2`}>
+                      <Value v={c.signal_dbm != null ? `${c.signal_dbm} dBm` : undefined} />
                     </td>
                     <td className={`${TD_CLS} tnum font-mono text-ink2`}>
-                      {c.signal_dbm != null ? `${c.signal_dbm} dBm` : '\u2014'}
+                      <Value v={formatWifiLink(c)} />
                     </td>
-                    <td className={`${TD_CLS} tnum font-mono text-ink2`}>{formatWifiLink(c)}</td>
                     <td className="tnum py-2 font-mono text-caption text-ink3">{c.mac}</td>
                   </tr>
                 ))}
@@ -145,49 +174,68 @@ export default function ClientsTab() {
         </Card>
       )}
 
-      {(grouped.usb.length > 0 || usbLink) && (
+      {(grouped.usb.length > 0 || usbLink || usbFailed) && (
         <Card title={`USB-C (${grouped.usb.length})`} pad={false}>
-          <div className="px-4 pb-3">
-            {usbLink && (
-              <div className="mb-3 flex flex-wrap items-center gap-2 rounded-ctl bg-surface2/70 px-3 py-2">
-                <span className="label">Tether link</span>
-                <span className="text-body font-bold text-ink">
-                  {usbLink.negotiated_label ?? usbLink.negotiated ?? 'Unknown'}
-                  {usbNegotiatedRate && <span className="font-medium text-ink2"> · {usbNegotiatedRate}</span>}
-                </span>
-                {usbLink.at_full_speed === false && usbMaxRate && (
-                  <Chip tone="warn">
-                    {usbLink.max_label ?? 'Higher'} capable · {usbMaxRate} — cable/port limiting
-                  </Chip>
-                )}
-                {usbLink.at_full_speed === true && <Chip tone="ok">Full speed</Chip>}
-              </div>
-            )}
+          <div className="pb-3">
+            <div className="space-y-3 px-4">
+              {usbFailed && (
+                <InlineStatus
+                  kind={usbPoll.data ? 'stale' : 'error'}
+                  action={{ label: 'Retry', onClick: usbPoll.refresh, loading: usbPoll.refreshing }}
+                >
+                  {usbPoll.data
+                    ? `Showing the last USB link details that loaded. The latest read failed: ${usbPoll.error}`
+                    : `USB link details are unavailable: ${usbPoll.error}`}
+                </InlineStatus>
+              )}
+              {usbLink && (
+                <div className="flex flex-wrap items-center gap-2 rounded-ctl bg-surface2/70 px-3 py-2">
+                  <span className="label">Tether link</span>
+                  <span className="text-body font-bold text-ink">
+                    {usbLink.negotiated_label ?? usbLink.negotiated ?? 'Unknown'}
+                    {usbNegotiatedRate && <span className="font-medium text-ink2"> · {usbNegotiatedRate}</span>}
+                  </span>
+                  {usbLink.at_full_speed === false && usbMaxRate && (
+                    <Chip tone="warn" wrap>
+                      {usbLink.max_label ?? 'Higher'} capable · {usbMaxRate} — cable/port limiting
+                    </Chip>
+                  )}
+                  {usbLink.at_full_speed === true && <Chip tone="ok">Full speed</Chip>}
+                </div>
+              )}
+            </div>
             {grouped.usb.length > 0 ? (
-              <div className="overflow-x-auto">
-                <table className="w-full text-body">
-                  <thead>
-                    <tr className="label border-b border-line/8 text-left">
-                      <th className={TH_CLS}>Hostname</th>
-                      <th className={TH_CLS}>IP</th>
-                      <th className={TH_CLS}>Interface</th>
-                      <th className="pb-1.5 font-semibold">MAC</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {grouped.usb.map((c) => (
-                      <tr key={c.mac} className="border-b border-line/6 last:border-0">
-                        <td className={`${TD_CLS} font-medium text-ink`}>{c.hostname || '\u2014'}</td>
-                        <td className={`${TD_CLS} tnum font-mono text-meta text-ink2`}>{c.ip ?? '\u2014'}</td>
-                        <td className={`${TD_CLS} tnum font-mono text-meta text-ink2`}>{c.interface ?? '\u2014'}</td>
-                        <td className="tnum py-2 font-mono text-caption text-ink3">{c.mac}</td>
+              <>
+                <StackedClients group="usb" items={grouped.usb} />
+                <div className="hidden overflow-x-auto px-4 sm:block">
+                  <table className="mt-3 w-full text-body">
+                    <thead>
+                      <tr className="label border-b border-line/8 text-left">
+                        <th className={TH_CLS}>Hostname</th>
+                        <th className={TH_CLS}>IP</th>
+                        <th className={TH_CLS}>Interface</th>
+                        <th className="pb-1.5 font-semibold">MAC</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {grouped.usb.map((c) => (
+                        <tr key={c.mac} className="border-b border-line/6 last:border-0">
+                          <td className={`${TD_CLS} font-medium text-ink`}>{hostname(c)}</td>
+                          <td className={MONO_TD}>
+                            <Value v={c.ip} />
+                          </td>
+                          <td className={MONO_TD}>
+                            <Value v={c.interface} />
+                          </td>
+                          <td className="tnum py-2 font-mono text-caption text-ink3">{c.mac}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
             ) : (
-              <p className="text-body text-ink3">No USB-C clients connected</p>
+              !staleClients && <p className="mt-3 px-4 text-body text-ink3">No USB-C clients connected</p>
             )}
           </div>
         </Card>
@@ -195,7 +243,8 @@ export default function ClientsTab() {
 
       {grouped.ethernet.length > 0 && (
         <Card title={`Ethernet (${grouped.ethernet.length})`} pad={false}>
-          <div className="overflow-x-auto px-4 pb-3">
+          <StackedClients group="ethernet" items={grouped.ethernet} />
+          <div className="hidden overflow-x-auto px-4 pb-3 sm:block">
             <table className="w-full text-body">
               <thead>
                 <tr className="label border-b border-line/8 text-left">
@@ -208,9 +257,13 @@ export default function ClientsTab() {
               <tbody>
                 {grouped.ethernet.map((c) => (
                   <tr key={c.mac} className="border-b border-line/6 last:border-0">
-                    <td className={`${TD_CLS} font-medium text-ink`}>{c.hostname || '\u2014'}</td>
-                    <td className={`${TD_CLS} tnum font-mono text-meta text-ink2`}>{c.ip ?? '\u2014'}</td>
-                    <td className={`${TD_CLS} tnum font-mono text-ink2`}>{formatLinkMbps(c.wired_link_mbps)}</td>
+                    <td className={`${TD_CLS} font-medium text-ink`}>{hostname(c)}</td>
+                    <td className={MONO_TD}>
+                      <Value v={c.ip} />
+                    </td>
+                    <td className={`${TD_CLS} tnum font-mono text-ink2`}>
+                      <Value v={formatLinkMbps(c.wired_link_mbps)} />
+                    </td>
                     <td className="tnum py-2 font-mono text-caption text-ink3">{c.mac}</td>
                   </tr>
                 ))}
@@ -222,7 +275,8 @@ export default function ClientsTab() {
 
       {grouped.other.length > 0 && (
         <Card title={`Other (${grouped.other.length})`} pad={false}>
-          <div className="overflow-x-auto px-4 pb-3">
+          <StackedClients group="other" items={grouped.other} />
+          <div className="hidden overflow-x-auto px-4 pb-3 sm:block">
             <table className="w-full text-body">
               <thead>
                 <tr className="label border-b border-line/8 text-left">
@@ -234,8 +288,10 @@ export default function ClientsTab() {
               <tbody>
                 {grouped.other.map((c) => (
                   <tr key={c.mac} className="border-b border-line/6 last:border-0">
-                    <td className={`${TD_CLS} font-medium text-ink`}>{c.hostname || '\u2014'}</td>
-                    <td className={`${TD_CLS} tnum font-mono text-meta text-ink2`}>{c.ip ?? '\u2014'}</td>
+                    <td className={`${TD_CLS} font-medium text-ink`}>{hostname(c)}</td>
+                    <td className={MONO_TD}>
+                      <Value v={c.ip} />
+                    </td>
                     <td className="tnum py-2 font-mono text-caption text-ink3">{c.mac}</td>
                   </tr>
                 ))}

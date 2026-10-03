@@ -1,42 +1,46 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import { api } from '../../data/api'
+import { useResource } from '../../data/poll'
 import type { TtlStatus } from '../../types'
-import { Button, Input } from '../../ui/controls'
-import { toast, toastError } from '../../ui/feedback'
-import { Card, Chip } from '../../ui/primitives'
+import { Button, Field, Input } from '../../ui/controls'
+import { toastError } from '../../ui/feedback'
+import { Card, Chip, InlineStatus, Skeleton } from '../../ui/primitives'
+import { parseTtl, ttlFamilies, ttlInputValue, ttlState } from './ttlView'
 
 export default function TtlTab() {
-  const [status, setStatus] = useState<TtlStatus | null>(null)
-  const [ttlInput, setTtlInput] = useState('65')
+  const status = useResource<TtlStatus>('ttl-status', api.ttlStatus)
+  const [draft, setDraft] = useState<string | null>(null)
+  const [fieldError, setFieldError] = useState<string | undefined>()
   const [busy, setBusy] = useState(false)
+  // The router accepted a change but the status could not be re-read afterwards.
+  const [unverified, setUnverified] = useState(false)
 
-  const fetchStatus = useCallback(async () => {
+  const state = ttlState(status.data)
+  const ttlText = ttlInputValue(draft, status.data)
+
+  /** Re-read after an accepted change; a failed read-back is reported, never hidden. */
+  async function readBack() {
     try {
-      const data = await api.ttlStatus()
-      setStatus(data)
-      if (data.ttl_value && data.ttl_value > 0) setTtlInput(String(data.ttl_value))
+      status.mutate(await api.ttlStatus())
+      setUnverified(false)
     } catch {
-      setStatus(null)
+      setUnverified(true)
     }
-  }, [])
-
-  useEffect(() => {
-    fetchStatus()
-  }, [fetchStatus])
-
-  const active = Boolean(status?.active || status?.ipv6_active)
+  }
 
   async function applyTtl() {
-    const val = parseInt(ttlInput)
-    if (!val || val < 1 || val > 255) {
-      toast('TTL must be 1-255', 'err')
+    if (busy) return
+    const parsed = parseTtl(ttlText)
+    if (!parsed.ok) {
+      setFieldError(parsed.error)
       return
     }
+    setFieldError(undefined)
     setBusy(true)
     try {
-      await api.ttlSet(val)
-      toast(`TTL set to ${val} (IPv4 + IPv6)`)
-      await fetchStatus()
+      await api.ttlSet(parsed.ttl)
+      setDraft(null)
+      await readBack()
     } catch (e) {
       toastError(e, 'Failed to set TTL')
     } finally {
@@ -45,11 +49,12 @@ export default function TtlTab() {
   }
 
   async function clearTtl() {
+    if (busy) return
     setBusy(true)
     try {
       await api.ttlClear()
-      toast('TTL clamping disabled')
-      await fetchStatus()
+      setFieldError(undefined)
+      await readBack()
     } catch (e) {
       toastError(e, 'Failed to clear TTL')
     } finally {
@@ -57,27 +62,67 @@ export default function TtlTab() {
     }
   }
 
-  return (
-    <Card title="TTL clamping">
-      <div className="space-y-3">
-        <p className="text-meta text-ink2">
-          Overrides the TTL / hop limit on LAN ingress traffic to prevent carrier tethering detection.
-          Applied immediately and persists across reboots.
-        </p>
+  const input = (placeholder?: string) => (
+    <div className="w-28">
+      <Field label="TTL value" hint="1 to 255" error={fieldError}>
+        {(ids) => (
+          <Input
+            id={ids.id}
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={255}
+            step={1}
+            value={ttlText}
+            placeholder={placeholder}
+            onChange={(e) => {
+              setDraft(e.target.value)
+              setFieldError(undefined)
+            }}
+            aria-describedby={ids.describedBy}
+            aria-invalid={ids.invalid || undefined}
+          />
+        )}
+      </Field>
+    </div>
+  )
 
-        {status == null ? (
-          <p className="text-body text-ink3">Checking status…</p>
-        ) : active ? (
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-3">
-            <div className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-ok" />
-              <span className="tnum font-mono text-body font-semibold text-ok">Active (TTL={status.ttl_value})</span>
-              {status.ipv6_active && <Chip tone="default">IPv4 + IPv6</Chip>}
+  let body
+  if (status.status === 'loading') {
+    body = <Skeleton className="h-16" />
+  } else if (!status.data) {
+    body = (
+      <InlineStatus kind="error" action={{ label: 'Retry', onClick: status.refresh, loading: status.refreshing }}>
+        TTL status could not be read{status.error ? `: ${status.error}` : '.'}
+      </InlineStatus>
+    )
+  } else {
+    const families = ttlFamilies(status.data)
+    body = (
+      <div className="space-y-3">
+        {status.status === 'stale' && (
+          <InlineStatus kind="stale" action={{ label: 'Retry', onClick: status.refresh, loading: status.refreshing }}>
+            Showing the last TTL status read. The latest refresh failed.
+          </InlineStatus>
+        )}
+        {unverified && (
+          <InlineStatus kind="warn" action={{ label: 'Re-read status', onClick: () => void readBack() }}>
+            The router accepted the change, but the TTL status could not be re-read. What is shown may be out of date.
+          </InlineStatus>
+        )}
+        {state === 'unknown' ? (
+          <InlineStatus kind="warn" action={{ label: 'Retry', onClick: status.refresh, loading: status.refreshing }}>
+            The router did not report whether TTL clamping is on.
+          </InlineStatus>
+        ) : state === 'active' ? (
+          <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
+            <div className="flex items-center gap-2 pb-2">
+              <span className="h-2 w-2 rounded-full bg-ok" aria-hidden="true" />
+              <span className="tnum font-mono text-body font-semibold text-ok">Active (TTL={status.data.ttl_value ?? '?'})</span>
+              {families && <Chip tone="default">{families}</Chip>}
             </div>
-            <div className="flex items-center gap-2">
-              <div className="w-20">
-                <Input type="number" min={1} max={255} value={ttlInput} onChange={(e) => setTtlInput(e.target.value)} />
-              </div>
+            <div className="flex items-end gap-2">
+              {input()}
               <Button variant="outline" onClick={applyTtl} loading={busy}>
                 Update
               </Button>
@@ -87,15 +132,25 @@ export default function TtlTab() {
             </div>
           </div>
         ) : (
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="w-24">
-              <Input type="number" min={1} max={255} value={ttlInput} onChange={(e) => setTtlInput(e.target.value)} placeholder="65" />
-            </div>
-            <Button variant="primary" onClick={applyTtl} loading={busy} disabled={!ttlInput}>
+          <div className="flex flex-wrap items-end gap-2">
+            {input('65')}
+            <Button variant="primary" onClick={applyTtl} loading={busy} disabled={!ttlText}>
               Enable clamping
             </Button>
           </div>
         )}
+      </div>
+    )
+  }
+
+  return (
+    <Card title="TTL clamping">
+      <div className="space-y-3">
+        <p className="text-meta text-ink2">
+          Overrides the TTL / hop limit on LAN ingress traffic to prevent carrier tethering detection.
+          Applied immediately and persists across reboots.
+        </p>
+        {body}
       </div>
     </Card>
   )

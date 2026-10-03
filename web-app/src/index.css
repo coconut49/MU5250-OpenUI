@@ -142,9 +142,30 @@ body {
   background: rgb(var(--accent) / 0.2);
 }
 
+/* Focus (design.md § Focus): 2 px solid accent, 2 px offset, instant. Opaque on purpose — the
+   old 55 %-opacity ring measured 2.2–2.9:1. Inside .band --accent is re-scoped, so it follows.
+   The gap (offset) is what separates the ring from a filled accent/danger control. */
 :focus-visible {
-  outline: 2px solid rgb(var(--accent) / 0.55);
+  outline: 2px solid rgb(var(--accent));
   outline-offset: 2px;
+}
+
+/* For unfilled controls inside an overflow container (tab strip, bottom nav) so the ring is not clipped. */
+@layer utilities {
+  .focus-inset:focus-visible {
+    outline-offset: -2px;
+  }
+}
+
+/* Programmatic focus targets (main, dialog) are not controls. */
+main:focus,
+dialog:focus {
+  outline: none;
+}
+
+/* Native <dialog> chrome is replaced by the confirm host's own panel. */
+dialog::backdrop {
+  background: transparent;
 }
 
 *::-webkit-scrollbar {

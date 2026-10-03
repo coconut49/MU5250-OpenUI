@@ -1,3 +1,5 @@
+import plugin from 'tailwindcss/plugin'
+
 /** @type {import('tailwindcss').Config} */
 export default {
   darkMode: ['class', '[data-theme="dark"]'],
@@ -53,5 +55,10 @@ export default {
       },
     },
   },
-  plugins: [],
+  plugins: [
+    // `coarse:` applies only to touch-first pointers — the ≥44 px hit-area rule (design.md § Touch targets).
+    plugin(({ addVariant }) => {
+      addVariant('coarse', '@media (pointer: coarse)')
+    }),
+  ],
 }

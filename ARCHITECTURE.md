@@ -168,14 +168,27 @@ and USB status (`zwrt_bsp.usb list` + configfs + UDC sysfs).
     lists, EARFCN/NR-ARFCN into MHz, UCS-2 SMS hex into text. The agent
     passes most ubus payloads through raw, so this is where firmware
     knowledge lives on the client side.
-  - `poll.ts` / `pollScheduler.ts`: `usePoll(key, fn, interval)`. Polls
-    never overlap, pause while the tab is hidden, keep a module-level
-    last-good cache so group switches render instantly, and use a revision
-    counter so a mutation discards in-flight stale reads.
+  - `poll.ts` / `pollScheduler.ts`: `usePoll(key, fn, interval)` and the
+    one-shot `useResource(key, fn)` each own one resource and report
+    `status` (`loading`, `ready`, `error`, `stale`). Polls never overlap,
+    pause while the tab is hidden, and use a revision counter so a mutation
+    discards in-flight stale reads. A key change never shows the previous
+    key's data. The module-level last-good cache lets group switches render
+    instantly and is cleared on logout and auth expiry.
+  - `signalQuality.ts`: the single RSRP/RSRQ/SINR rating policy; classifiers
+    and legends derive from it. `bands.ts`, `usage.ts`, `dates.ts`,
+    `wifiWidth.ts` and `validate.ts` are pure mappers and validators.
+    Unknown firmware values map to `null`/unknown, not to a default.
 - **Heartbeat:** `HomeProvider` polls `/api/dashboard` every 3 s on Home
   and Signal, and every 15 s elsewhere, where it only feeds the alert banner.
-  Home, Signal and Modem → Data all read it; nothing re-polls the same data.
-  Expensive views (clients, process list) poll slowly or load on demand.
+  It stays the one heartbeat: Home, Signal and Modem → Data all read it;
+  nothing re-polls the same data. Other resources are owned by the screen
+  that shows them (`usePoll`/`useResource`); expensive views (clients,
+  process list) poll slowly or load on demand.
+- **Mutations:** connection-dropping actions are confirmed through one native
+  `<dialog>` host (`ui/feedback.tsx`) before anything is sent. The reviewed
+  payload is frozen first, and the dashboard reports "accepted" separately
+  from "verified by read-back". It never retries a mutation automatically.
 - **Design system:** [web-app/design.md](web-app/design.md) (tokens in
   `src/index.css`, exposed to Tailwind). Fonts are self-hosted. There are
   no runtime dependencies beyond React.
@@ -184,10 +197,18 @@ and USB status (`zwrt_bsp.usb list` + configfs + UDC sysfs).
 
 Three copies of the API must agree: the agent route table (`server.rs`), the
 client bindings (`api.ts`) and the mock agent (`web-app/tools/mock_agent.py`).
-`scripts/check-api-contract.py` fails CI if they drift. Rust unit tests pin
-the key sets of the payloads the dashboard reads verbatim (speed snapshot,
-process list).
+`scripts/check-api-contract.py` fails CI if they drift. It compares **method
+and path**, so a GET binding for a PUT-only route is a failure
+(`tests/test_api_contract.py` tests the checker). Rust unit tests pin the key
+sets of the payloads the dashboard reads verbatim (speed snapshot, process
+list).
 
+The mock agent is stateful: mutations validate like the agent and change what
+the next read reports. It exposes `/__mock/requests` and `/__mock/reset`, and
+`MOCK_SCENARIO` (`SA`, `NSA`, `LTE`, `disconnected`) selects the radio. The
+Playwright browser harness (`npm run test:browser`, in CI) answers `/api`
+from an in-process synthetic agent and aborts every other host, so it never
+reaches a real agent.
 ## Deployment model
 
 ```

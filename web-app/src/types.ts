@@ -3,7 +3,8 @@
 export interface CarrierComponent {
   label: string // "PCC", "SCC0", "SCC1", etc.
   band: string // "B8", "n78"
-  pci: number
+  /** Physical cell ID. 0 is a valid PCI; undefined = the firmware did not report a valid one. */
+  pci?: number
   earfcn: number
   bandwidth: string // "10 MHz"
   freq?: number // MHz, calculated from EARFCN
@@ -15,19 +16,47 @@ export interface CarrierComponent {
   active?: boolean
 }
 
+/**
+ * Observed band-lock state. `unknown` (missing/unparseable) is not `automatic`
+ * (a known absence of any explicit restriction); `locked` carries sorted,
+ * deduplicated band numbers.
+ */
+export type BandLockState =
+  | { kind: 'unknown' }
+  | { kind: 'automatic' }
+  | { kind: 'locked'; bands: number[] }
+
+/** The carrier Home/Signal should treat as the serving cell, picked from validated carriers. */
+export interface PrimaryCarrier {
+  rat: 'lte' | 'nr'
+  carrier: CarrierComponent
+}
+
 export interface SignalInfo {
   type?: string
   carrier?: string
+  /** 0–5. undefined = not reported; a genuine 0 stays 0. */
   signal_bars?: number
   cell_id?: string
   lte_carriers: CarrierComponent[]
   nr_carriers: CarrierComponent[]
+  /**
+   * Serving carrier chosen by network mode from validated carriers only:
+   * SA -> NR PCC; LTE/4G -> LTE PCC; NSA/ENDC -> the LTE anchor PCC (the NR leg
+   * is an SCG shown in nr_carriers); nothing valid -> undefined (never a raw
+   * fallback, and never LTE while in SA even though the firmware populates
+   * LTE fields there).
+   */
+  primary?: PrimaryCarrier
   net_select?: string
-  lte_band_lock?: number[]
-  nr_band_lock?: number[]
+  lte_band_lock_state: BandLockState
+  nr_sa_band_lock_state: BandLockState
+  nr_nsa_band_lock_state: BandLockState
   raw_lte_band_lock?: string
+  /** Display string "SA=<raw> NSA=<raw>" (diagnostics only). */
   raw_nr_band_lock?: string
-  rsrp?: number
+  raw_nr_sa_band_lock?: string
+  raw_nr_nsa_band_lock?: string
   band?: string
 }
 
@@ -119,6 +148,17 @@ export interface UsbLink {
   at_full_speed?: boolean
 }
 
+/**
+ * Result of `PUT /api/usb/mode`. NCM (and ECM rollback from NCM) are only
+ * *scheduled* (HTTP 202, `status: "scheduled"`): the active mode has not
+ * changed yet and must be verified by re-reading status. ECM/RNDIS go through
+ * ZTE's ubus and return its payload unchanged ('applied' = accepted by ubus;
+ * the firmware's own reboot semantics apply).
+ */
+export type UsbModeResult =
+  | { state: 'scheduled'; mode: UsbMode | null; experimental: boolean; delayMs: number | null; rollback?: string }
+  | { state: 'applied'; raw: Record<string, unknown> }
+
 export interface UsbStatus {
   active_mode: UsbMode | null
   default_mode?: UsbMode
@@ -150,7 +190,14 @@ export interface WifiBand {
   channel?: number
   bandwidth?: string
   configuredChannel?: string
+  /** Raw UCI htmode, PHY mode + width, e.g. "EHT80". */
   configuredBandwidth?: string
+  /** configuredBandwidth normalised to MHz (R13); undefined if unrecognised. */
+  configuredWidthMhz?: number
+  /** Observed runtime width normalised to MHz (R13); undefined if missing/unrecognised. */
+  actualWidthMhz?: number
+  /** Configured TX power as a percentage, validated integer 1–100 (R09). undefined = unknown. */
+  txpowerPercent?: number
   bandwidthOptions?: string[]
   supportedStandards?: string
   actualChannel?: number
@@ -266,10 +313,18 @@ export interface ApnProfile {
   wanapn: string
   username: string
   password: string
-  pdpType: number
-  pppAuthMode: number
+  /** 1=IPv4, 2=IPv6, 3=IPv4v6; null = missing/unrecognised. */
+  pdpType: number | null
+  /** 0=None, 1=PAP, 2=CHAP, 3=PAP/CHAP; null = missing/unrecognised. */
+  pppAuthMode: number | null
   profileId: string
   isEnable: boolean
+}
+
+/** Validated `apn_mode` (0 = automatic, 1 = manual). Missing/other values are 'unknown', never 'auto'. */
+export interface ApnModeState {
+  mode: 'auto' | 'manual' | 'unknown'
+  raw: unknown
 }
 
 export interface SimInfo {
@@ -280,22 +335,44 @@ export interface SimInfo {
   mnc?: string
 }
 
+/** A date with no time or zone, as the router reports it. Never a UTC instant. */
+export interface CalendarDate {
+  year: number
+  month: number // 1–12
+  day: number // 1–31
+}
+
+/** null = the agent could not read the counter (unknown); 0 is a real measured zero. */
 export interface UsagePeriod {
-  rx_bytes: number
-  tx_bytes: number
-  time_secs: number
+  rx_bytes: number | null
+  tx_bytes: number | null
+  time_secs: number | null
 }
 
 export interface DataUsage {
   day: UsagePeriod
   month: UsagePeriod
+  /** Same firmware month counters as `month`. Missing in the payload = undefined. */
   cycle?: UsagePeriod
+  /**
+   * Firmware `real_*` counters. The API name is historical: these are NOT
+   * proven to be "since power on" (observed counter time 15.8 h vs uptime
+   * 20.5 h); they behave like connection-scoped counters. Keep the field name
+   * for contract compatibility; do not word the UI as "since power on".
+   */
   since_power_on?: UsagePeriod
   total: UsagePeriod
-  reset_day?: number
-  reset_enabled?: boolean
+  /** 1–31, or null when unknown (agent emits null when neither ubus nor UCI could be read). */
+  reset_day: number | null
+  /** null = unknown (not "disabled"). */
+  reset_enabled: boolean | null
+  /** Raw firmware strings, kept for display/debugging. */
   clear_date_record?: string
   next_clear_date?: string
+  /** `clear_date_record` parsed as a calendar date; null if missing/invalid. */
+  cycle_start?: CalendarDate | null
+  /** `next_clear_date` parsed as a calendar date; null if missing/invalid. */
+  next_reset?: CalendarDate | null
 }
 
 export interface SmsMessage {

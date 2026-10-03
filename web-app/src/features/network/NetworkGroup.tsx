@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Tabs } from '../../ui/Tabs'
+import { TabPanel, Tabs } from '../../ui/Tabs'
 import ClientsTab from './ClientsTab'
 import WifiTab from './WifiTab'
 import RouterTab from './RouterTab'
@@ -24,11 +24,15 @@ export default function NetworkGroup() {
         ]}
         active={tab}
         onChange={setTab}
+        label="Network sections"
+        idBase="network"
       />
 
-      {tab === 'clients' && <ClientsTab />}
-      {tab === 'wifi' && <WifiTab />}
-      {tab === 'router' && <RouterTab />}
+      <TabPanel idBase="network" id={tab} className="space-y-4">
+        {tab === 'clients' && <ClientsTab />}
+        {tab === 'wifi' && <WifiTab />}
+        {tab === 'router' && <RouterTab />}
+      </TabPanel>
     </div>
   )
 }

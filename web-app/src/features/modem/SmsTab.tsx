@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useRef, useState } from 'react'
 import { api } from '../../data/api'
+import { useResource } from '../../data/poll'
 import type { SmsCapabilities, SmsMessage } from '../../types'
 import { IMessage, IPlus } from '../../icons'
 import { Button, Field, Input, Segmented } from '../../ui/controls'
 import { toast, toastError, confirm } from '../../ui/feedback'
-import { Card, Empty, Skeleton } from '../../ui/primitives'
+import { Card, Empty, InlineStatus, Skeleton } from '../../ui/primitives'
+import { findMessage, inBox, markRead, reconcileSelection, removeMessage, restoreUnread, unreadCount, type Box } from './smsCollection'
 
-const BOX_INBOX = 1
-const BOX_SENT = 2
+type SmsList = { messages: SmsMessage[]; dropped: number }
 
 function formatDate(d?: string) {
   if (!d) return ''
@@ -23,42 +24,58 @@ function formatDate(d?: string) {
 }
 
 export default function SmsTab() {
-  const [box, setBox] = useState(BOX_INBOX)
-  const [messages, setMessages] = useState<SmsMessage[]>([])
-  const [loading, setLoading] = useState(true)
-  const [selected, setSelected] = useState<SmsMessage | null>(null)
+  const caps = useResource<SmsCapabilities>('sms-capabilities', api.smsCapabilities)
+  const ready = !!caps.data?.available && !!caps.data.ready
+  // The whole collection is stored once. `mutate` publishes an acknowledged change and discards any
+  // older in-flight list read, so a pre-delete / pre-mark-read response can never overwrite it.
+  const list = useResource<SmsList>('sms-list', api.smsListChecked, ready)
+
+  const [box, setBox] = useState<Box>('inbox')
+  const [selectedId, setSelectedId] = useState<number | null>(null)
   const [composing, setComposing] = useState(false)
   const [to, setTo] = useState('')
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
-  const [capabilities, setCapabilities] = useState<SmsCapabilities | null | undefined>(undefined)
+  const [markFailed, setMarkFailed] = useState<string | null>(null)
 
-  useEffect(() => {
-    api.smsCapabilities().then(setCapabilities).catch(() => setCapabilities(null))
-  }, [])
+  const all = list.data?.messages ?? null
+  // Always the latest collection, including a value published but not yet rendered.
+  const latest = useRef<SmsList | null>(null)
+  const rendered = useRef<SmsList | null>(null)
+  if (rendered.current !== list.data) {
+    // Only a genuinely new published value replaces the ref; a render that still carries the
+    // previous value must not undo a change committed but not yet rendered.
+    rendered.current = list.data
+    latest.current = list.data
+  }
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const all = await api.smsList()
-      setMessages(all.filter((message) => box === BOX_INBOX ? message.tag === 0 || message.tag === 1 : message.tag === 2 || message.tag === 3))
-    } catch {
-      setMessages([])
-    } finally {
-      setLoading(false)
-    }
-  }, [box])
+  function commit(next: SmsMessage[]) {
+    const value = { messages: next, dropped: latest.current?.dropped ?? 0 }
+    latest.current = value
+    list.mutate(value)
+  }
 
-  useEffect(() => {
-    if (capabilities?.available && capabilities.ready) load()
-    else if (capabilities !== undefined) setLoading(false)
-  }, [capabilities, load])
+  // Selection follows the message id and is dropped when that message leaves the collection.
+  const reconciled = all ? reconcileSelection(all, selectedId) : selectedId
+  if (reconciled !== selectedId) setSelectedId(reconciled)
 
-  async function markRead(id: number) {
+  const messages = all ? inBox(all, box) : []
+  const selected = all ? findMessage(messages, selectedId) : null
+  const unread = all ? unreadCount(all) : 0
+
+  async function markMessageRead(id: number) {
+    const current = latest.current
+    if (!current) return
+    setMarkFailed(null)
+    commit(markRead(current.messages, id))
     try {
       await api.smsRead([id])
-    } catch {
-      /* ignore */
+      // Acknowledged: re-assert so a list read started during the request cannot restore "unread".
+      if (latest.current) commit(markRead(latest.current.messages, id))
+    } catch (e) {
+      if (latest.current) commit(restoreUnread(latest.current.messages, id))
+      const why = e instanceof Error && e.message ? ` (${e.message})` : ''
+      setMarkFailed(`The router did not mark that message as read${why}. It is shown as unread again.`)
     }
   }
 
@@ -67,32 +84,32 @@ export default function SmsTab() {
     if (!ok) return
     try {
       await api.smsDelete([id])
-      setMessages((m) => m.filter((x) => x.id !== id))
-      if (selected?.id === id) setSelected(null)
-      toast('Message deleted')
+      // The row disappearing is the confirmation; no success toast.
+      if (latest.current) commit(removeMessage(latest.current.messages, id))
+      setSelectedId((cur) => (cur === id ? null : cur))
     } catch (e) {
       toastError(e, 'Delete failed')
     }
   }
 
   function openMsg(m: SmsMessage) {
-    setSelected(m)
-    if (m.tag === 1) {
-      markRead(m.id)
-      setMessages((ms) => ms.map((x) => (x.id === m.id ? { ...x, tag: 0 } : x)))
-    }
+    setSelectedId(m.id)
+    if (m.tag === 1) void markMessageRead(m.id)
   }
 
   async function send(e: React.FormEvent) {
     e.preventDefault()
+    // Freeze what is being sent.
+    const payload = { to, text }
     setSending(true)
     try {
-      await api.smsSend(to, text)
+      await api.smsSend(payload.to, payload.text)
       toast('Message sent')
       setTo('')
       setText('')
       setComposing(false)
-      if (box === BOX_SENT) load()
+      // Sent messages live in the same collection; re-read it whichever box is showing.
+      list.refresh()
     } catch (err) {
       toastError(err, 'Failed to send')
     } finally {
@@ -100,45 +117,77 @@ export default function SmsTab() {
     }
   }
 
-  const unread = messages.filter((m) => m.tag === 1).length
-
-  if (capabilities === undefined) return <Skeleton className="h-64" />
-  if (!capabilities?.available || !capabilities.ready) {
+  if (caps.status === 'loading') return <Skeleton className="h-64" />
+  if (caps.status === 'error' || !caps.data) {
+    return (
+      <InlineStatus kind="error" action={{ label: 'Retry', onClick: caps.refresh, loading: caps.refreshing }}>
+        SMS availability could not be checked{caps.error ? `: ${caps.error}` : '.'}
+      </InlineStatus>
+    )
+  }
+  if (!ready) {
     return (
       <Card title="SMS unavailable">
         <Empty
           icon={<IMessage size={26} />}
           title="Firmware WMS is not ready"
-          body={capabilities?.reason ?? 'The agent could not verify the SMS service, so listing, sending, and deletion are disabled.'}
+          body={caps.data.reason ?? 'The agent could not verify the SMS service, so listing, sending, and deletion are disabled.'}
         />
+        <div className="flex justify-center">
+          <Button size="sm" variant="ghost" onClick={caps.refresh} loading={caps.refreshing}>
+            Check again
+          </Button>
+        </div>
       </Card>
     )
   }
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <Segmented
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Segmented<Box>
+          label="Message box"
           options={[
-            { value: String(BOX_INBOX), label: unread > 0 ? `Inbox (${unread})` : 'Inbox' },
-            { value: String(BOX_SENT), label: 'Sent' },
+            { value: 'inbox', label: unread > 0 ? `Inbox (${unread})` : 'Inbox' },
+            { value: 'sent', label: 'Sent' },
           ]}
-          value={String(box)}
+          value={box}
           onChange={(v) => {
-            setBox(Number(v))
-            setSelected(null)
+            setBox(v)
+            setSelectedId(null)
           }}
         />
-        <Button
-          variant="primary"
-          onClick={() => {
-            setComposing(true)
-            setSelected(null)
-          }}
-        >
-          <IPlus size={14} /> New
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" onClick={list.refresh} loading={list.refreshing} aria-label="Refresh messages">
+            Refresh
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => {
+              setComposing(true)
+              setSelectedId(null)
+            }}
+          >
+            <IPlus size={14} /> New
+          </Button>
+        </div>
       </div>
+
+      {list.status === 'stale' && (
+        <InlineStatus kind="stale" action={{ label: 'Retry', onClick: list.refresh, loading: list.refreshing }}>
+          Showing the last messages loaded. Refreshing failed{list.error ? `: ${list.error}` : '.'}
+        </InlineStatus>
+      )}
+      {markFailed && (
+        <InlineStatus kind="error" action={{ label: 'Dismiss', onClick: () => setMarkFailed(null) }}>
+          {markFailed}
+        </InlineStatus>
+      )}
+      {list.data && list.data.dropped > 0 && (
+        <InlineStatus kind="warn" live={false}>
+          {list.data.dropped} message{list.data.dropped === 1 ? '' : 's'} from the router could not be read and {list.data.dropped === 1 ? 'is' : 'are'} not shown.
+        </InlineStatus>
+      )}
 
       {composing && (
         <Card title="New message">
@@ -170,12 +219,18 @@ export default function SmsTab() {
       )}
 
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
-        <Card className="lg:col-span-1" title={box === BOX_INBOX ? 'Inbox' : 'Sent'} pad={false}>
-          {loading ? (
+        <Card className="lg:col-span-1" title={box === 'inbox' ? 'Inbox' : 'Sent'} pad={false}>
+          {list.status === 'loading' ? (
             <div className="space-y-2 p-4">
               <Skeleton className="h-14" />
               <Skeleton className="h-14" />
               <Skeleton className="h-14" />
+            </div>
+          ) : list.status === 'error' || !all ? (
+            <div className="p-4">
+              <InlineStatus kind="error" action={{ label: 'Retry', onClick: list.refresh, loading: list.refreshing }}>
+                Messages could not be loaded{list.error ? `: ${list.error}` : '.'}
+              </InlineStatus>
             </div>
           ) : messages.length === 0 ? (
             <Empty icon={<IMessage size={26} />} title="No messages" />
@@ -185,6 +240,7 @@ export default function SmsTab() {
                 <li key={m.id}>
                   <button
                     onClick={() => openMsg(m)}
+                    aria-current={selected?.id === m.id ? 'true' : undefined}
                     className={`block w-full px-4 py-2.5 text-left transition-colors hover:bg-surface2/60 ${
                       selected?.id === m.id ? 'bg-accent/8' : ''
                     }`}
@@ -193,7 +249,12 @@ export default function SmsTab() {
                       <p className={`truncate text-body ${m.tag === 1 ? 'font-bold text-ink' : 'font-medium text-ink2'}`}>
                         {m.number || '—'}
                       </p>
-                      {m.tag === 1 && <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-accent" />}
+                      {m.tag === 1 && (
+                        <>
+                          <span aria-hidden="true" className="mt-1 h-2 w-2 shrink-0 rounded-full bg-accent" />
+                          <span className="sr-only">Unread</span>
+                        </>
+                      )}
                     </div>
                     <p className="mt-0.5 truncate text-meta text-ink3">{m.content}</p>
                     <p className="tnum font-mono mt-0.5 text-caption text-ink3">{formatDate(m.date)}</p>
@@ -210,7 +271,7 @@ export default function SmsTab() {
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <p className="truncate text-body font-semibold text-ink">
-                    {box === BOX_INBOX ? 'From' : 'To'}: {selected.number || '\u2014'}
+                    {box === 'inbox' ? 'From' : 'To'}: {selected.number || '\u2014'}
                   </p>
                   <p className="tnum font-mono mt-0.5 text-caption text-ink3">{formatDate(selected.date)}</p>
                 </div>
@@ -221,13 +282,13 @@ export default function SmsTab() {
               <div className="rounded-ctl bg-surface2/70 p-3.5">
                 <p className="whitespace-pre-wrap break-words text-body leading-relaxed text-ink">{selected.content}</p>
               </div>
-              {box === BOX_INBOX && (
+              {box === 'inbox' && (
                 <Button
                   variant="outline"
                   onClick={() => {
                     setComposing(true)
                     setTo(selected.number)
-                    setSelected(null)
+                    setSelectedId(null)
                   }}
                 >
                   Reply

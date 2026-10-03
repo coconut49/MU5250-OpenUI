@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { login, setToken } from '../data/client'
 import { Mark } from '../ui/Mark'
 import { Button } from '../ui/controls'
@@ -19,6 +19,8 @@ export default function Login({ onAuthed }: { onAuthed: () => void }) {
   const [pin, setPin] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
+  const pinId = useId()
+  const pwId = useId()
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -58,6 +60,7 @@ export default function Login({ onAuthed }: { onAuthed: () => void }) {
                   { value: 'password', label: 'Password' },
                 ]}
                 value={mode}
+                label="Sign-in method"
                 onChange={(m) => {
                   setMode(m)
                   setErr('')
@@ -67,31 +70,41 @@ export default function Login({ onAuthed }: { onAuthed: () => void }) {
           )}
 
           {mode === 'pin' ? (
-            <input
-              type="password"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              maxLength={6}
-              value={pin}
-              onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
-              className="tnum font-mono h-12 w-full rounded-ctl border border-line/12 bg-surface2/50 pl-[0.4em] text-center text-2xl font-medium tracking-[0.4em] text-ink outline-none transition-colors placeholder:text-ink3 focus:border-accent/60"
-              placeholder="••••••"
-              autoFocus
-              autoComplete="one-time-code"
-              enterKeyHint="done"
-              aria-label="PIN"
-            />
+            <div>
+              <label htmlFor={pinId} className="label mb-1 block">
+                PIN
+              </label>
+              <input
+                id={pinId}
+                type="password"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={6}
+                value={pin}
+                onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                className="tnum font-mono h-12 w-full rounded-ctl border border-line/12 bg-surface2/50 pl-[0.4em] text-center text-2xl font-medium tracking-[0.4em] text-ink transition-colors placeholder:text-ink3 focus:border-accent"
+                placeholder="••••••"
+                autoFocus
+                autoComplete="one-time-code"
+                enterKeyHint="done"
+              />
+            </div>
           ) : (
-            <input
-              type="password"
-              value={pw}
-              onChange={(e) => setPw(e.target.value)}
-              className="h-11 w-full rounded-ctl border border-line/12 bg-surface2/50 px-3.5 text-sm text-ink outline-none transition-colors placeholder:text-ink3 focus:border-accent/60"
-              placeholder="Agent password"
-              autoFocus
-              autoComplete="current-password"
-              aria-label="Agent password"
-            />
+            <div>
+              <label htmlFor={pwId} className="label mb-1 block">
+                Agent password
+              </label>
+              <input
+                id={pwId}
+                type="password"
+                value={pw}
+                onChange={(e) => setPw(e.target.value)}
+                className="h-11 w-full rounded-ctl border border-line/12 bg-surface2/50 px-3.5 text-sm text-ink transition-colors placeholder:text-ink3 focus:border-accent"
+                placeholder="Agent password"
+                autoFocus
+                autoComplete="current-password"
+              />
+            </div>
           )}
 
           {err && <p className="text-xs font-medium text-danger">{err}</p>}

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Tabs } from '../../ui/Tabs'
+import { TabPanel, Tabs } from '../../ui/Tabs'
 import ApnTab from './ApnTab'
 import DataTab from './DataTab'
 import TtlTab from './TtlTab'
@@ -26,12 +26,16 @@ export default function ModemGroup() {
         ]}
         active={tab}
         onChange={setTab}
+        label="Modem sections"
+        idBase="modem"
       />
 
-      {tab === 'apn' && <ApnTab />}
-      {tab === 'data' && <DataTab />}
-      {tab === 'ttl' && <TtlTab />}
-      {tab === 'sms' && <SmsTab />}
+      <TabPanel idBase="modem" id={tab} className="space-y-4">
+        {tab === 'apn' && <ApnTab />}
+        {tab === 'data' && <DataTab />}
+        {tab === 'ttl' && <TtlTab />}
+        {tab === 'sms' && <SmsTab />}
+      </TabPanel>
     </div>
   )
 }

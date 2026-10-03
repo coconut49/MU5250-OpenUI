@@ -242,20 +242,9 @@ fn read_data_usage_live(cache: &DashboardCache) -> Result<Value, String> {
         })
     };
 
-    let reset_day = number_value(clear.get("clearday")).unwrap_or_else(|| {
-        ubus::uci_get(&format!("{section}.clearday"))
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Value::from)
-            .unwrap_or(Value::from(1))
-    });
-    let reset_enabled = number_value(clear.get("enable")).unwrap_or_else(|| {
-        ubus::uci_get(&format!("{section}.clearday_enable"))
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Value::from)
-            .unwrap_or(Value::from(0))
-    });
+    let uci = |key: &str| ubus::uci_get(&format!("{section}.{key}")).ok();
+    let (reset_day, reset_enabled) =
+        reset_config(&clear, || uci("clearday"), || uci("clearday_enable"));
 
     // These two are billing-cycle dates: they change once a month, but used to
     // cost two `uci get` forks on every dashboard poll.
@@ -278,6 +267,27 @@ fn read_data_usage_live(cache: &DashboardCache) -> Result<Value, String> {
         "clear_date_record": clear_date_record,
         "next_clear_date": next_clear_date,
     }))
+}
+
+/// Reset-cycle configuration from the ubus reply, falling back to the persisted
+/// UCI values. A field neither source can supply is `null`: the old "day 1,
+/// disabled" default told the dashboard something the device never said.
+fn reset_config(
+    clear: &Value,
+    uci_day: impl FnOnce() -> Option<String>,
+    uci_enabled: impl FnOnce() -> Option<String>,
+) -> (Value, Value) {
+    let day = |v: Option<Value>| v.filter(|v| v.as_u64().is_some_and(|d| (1..=31).contains(&d)));
+    let enabled = |v: Option<Value>| v.filter(|v| matches!(v.as_u64(), Some(0 | 1)));
+    let from_uci = |v: Option<String>| number_value(v.map(Value::from).as_ref());
+
+    let reset_day = day(number_value(clear.get("clearday")))
+        .or_else(|| day(from_uci(uci_day())))
+        .unwrap_or(Value::Null);
+    let reset_enabled = enabled(number_value(clear.get("enable")))
+        .or_else(|| enabled(from_uci(uci_enabled())))
+        .unwrap_or(Value::Null);
+    (reset_day, reset_enabled)
 }
 
 fn number_value(value: Option<&Value>) -> Option<Value> {
@@ -389,4 +399,46 @@ pub fn read_radio(source: &Observed<Value>) -> Sample<Value> {
     source.read(SIGNAL_TTL, || {
         ubus::call("zte_nwinfo_api", "nwinfo_get_netinfo", Some("{}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn none() -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn reset_config_prefers_ubus_values() {
+        let clear = json!({"cid": 1, "enable": 1, "clearday": 16});
+        let uci_unused = || -> Option<String> { panic!("UCI read despite a ubus value") };
+        assert_eq!(
+            reset_config(&clear, uci_unused, uci_unused),
+            (json!(16), json!(1))
+        );
+    }
+
+    #[test]
+    fn reset_config_falls_back_to_uci() {
+        let (day, enabled) = reset_config(&json!({}), || Some("16".into()), || Some("0".into()));
+        assert_eq!((day, enabled), (json!(16), json!(0)));
+    }
+
+    #[test]
+    fn reset_config_is_unknown_when_both_sources_fail() {
+        assert_eq!(
+            reset_config(&json!({}), none, none),
+            (Value::Null, Value::Null)
+        );
+    }
+
+    #[test]
+    fn reset_config_rejects_out_of_range_values() {
+        let clear = json!({"enable": 2, "clearday": 0});
+        let (day, enabled) = reset_config(&clear, || Some("32".into()), || Some("x".into()));
+        assert_eq!((day, enabled), (Value::Null, Value::Null));
+        let (day, _) = reset_config(&json!({"clearday": "31"}), none, none);
+        assert_eq!(day, json!(31));
+    }
 }

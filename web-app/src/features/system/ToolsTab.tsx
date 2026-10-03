@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../../data/api'
-import { usePoll } from '../../data/poll'
+import { usePoll, useResource } from '../../data/poll'
 import { formatBytes, formatDuration } from '../../format'
 import type { LoggerDownload, LoggerStatus, ProcessListResult } from '../../types'
 import { IInfo, IRefresh } from '../../icons'
-import { Button, Field, Select } from '../../ui/controls'
+import { Button, Field, Input, Select } from '../../ui/controls'
 import { confirm, toast, toastError } from '../../ui/feedback'
-import { Card, Empty, Meter } from '../../ui/primitives'
+import { Card, Empty, InlineStatus, Meter } from '../../ui/primitives'
 
 function downloadCsv(csv: string, prefix: string) {
   const blob = new Blob([csv], { type: 'text/csv' })
@@ -179,12 +179,9 @@ function AtConsole() {
   const [timeout, setTimeout_] = useState(2)
   const [history, setHistory] = useState<{ cmd: string; response: string; error?: boolean }[]>([])
   const [busy, setBusy] = useState(false)
-  const [port, setPort] = useState<string | null | undefined>(undefined)
+  const portRes = useResource('tools-at-port', api.atPort)
+  const port = portRes.data ? portRes.data.port : undefined
   const outputRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    api.atPort().then((p) => setPort(p.port)).catch(() => setPort(null))
-  }, [])
 
   async function handleSend() {
     if (!command.trim() || busy) return
@@ -216,7 +213,7 @@ function AtConsole() {
         </span>
       }
     >
-      <div role="alert" className="mb-3 rounded-ctl border border-warn/30 bg-warn/10 px-3 py-2 text-meta text-warn">
+      <div className="mb-3 rounded-ctl border border-warn/30 bg-warn/10 px-3 py-2 text-meta text-warn">
         <strong>Safety warning:</strong> AT commands bypass the normal settings APIs and talk directly to the modem.
         Only use documented read-only queries; commands that write, reset, reboot, or alter radio state can interrupt service
         or persist after the agent exits.
@@ -227,6 +224,11 @@ function AtConsole() {
           <span className={port ? 'text-ok' : 'text-warn'}>{port ? ` Port: ${port}` : ' No AT port detected.'}</span>
         )}
       </p>
+      {portRes.status === 'error' && (
+        <InlineStatus kind="stale" className="mb-3" action={{ label: 'Retry', onClick: portRes.refresh, loading: portRes.refreshing }}>
+          AT port status could not be read.
+        </InlineStatus>
+      )}
 
       <div
         ref={outputRef}
@@ -244,27 +246,35 @@ function AtConsole() {
         {busy && <p className="animate-pulse text-ink3">Waiting for response…</p>}
       </div>
 
-      <div className="flex gap-2">
-        <input
-          type="text"
-          value={command}
-          onChange={(e) => setCommand(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              handleSend()
-            }
-          }}
-          placeholder="AT+COPS?"
-          className="h-9 min-w-0 flex-1 rounded-ctl border border-line/12 bg-surface2/50 px-3 font-mono text-body text-ink outline-none transition-colors placeholder:text-ink3 focus:border-accent/60"
-          autoComplete="off"
-        />
-        <Select value={timeout} onChange={(e) => setTimeout_(Number(e.target.value))} className="!w-20">
-          <option value={2}>2s</option>
-          <option value={5}>5s</option>
-          <option value={10}>10s</option>
-          <option value={30}>30s</option>
-        </Select>
+      <div className="flex flex-wrap items-end gap-2">
+        <div className="min-w-0 flex-1 basis-full sm:basis-48">
+          <Field label="AT command">
+            <Input
+              type="text"
+              value={command}
+              onChange={(e) => setCommand(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  handleSend()
+                }
+              }}
+              placeholder="AT+COPS?"
+              className="font-mono"
+              autoComplete="off"
+            />
+          </Field>
+        </div>
+        <div className="w-36 shrink-0">
+          <Field label="Timeout (seconds)">
+            <Select value={timeout} onChange={(e) => setTimeout_(Number(e.target.value))}>
+              <option value={2}>2</option>
+              <option value={5}>5</option>
+              <option value={10}>10</option>
+              <option value={30}>30</option>
+            </Select>
+          </Field>
+        </div>
         <Button variant="primary" onClick={handleSend} disabled={!command.trim()} loading={busy}>
           Send
         </Button>

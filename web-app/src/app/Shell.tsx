@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
-import { Suspense, useEffect, useState, type ReactNode } from 'react'
-import { useAlerts } from './HomeContext'
-import { IGauge, IGlobe, IHome, ISim, ISignal, IX, IMoon, ISun } from '../icons'
+import { Suspense, useEffect, type ReactNode } from 'react'
+import { AlertBanner } from './AlertBanner'
+import { IGauge, IGlobe, IHome, ISim, ISignal, IMoon, ISun } from '../icons'
 import { Mark } from '../ui/Mark'
 import { Spinner } from '../ui/primitives'
 
@@ -21,41 +21,6 @@ const GROUP_TITLES: Record<Group, string> = {
   network: 'Network',
   modem: 'Modem',
   system: 'System',
-}
-
-// ── Alert banner (fed by the home poll — zero extra requests) ─────────────────
-
-function AlertBanner() {
-  const alerts = useAlerts()
-  const [dismissed, setDismissed] = useState<Set<string>>(new Set())
-
-  const visible = alerts.filter((a) => !dismissed.has(a.message))
-  if (visible.length === 0) return null
-
-  return (
-    <div className="mb-4 space-y-1.5">
-      {visible.map((a) => (
-        <div
-          key={a.message}
-          className={`flex items-center gap-2.5 rounded-ctl border px-3 py-2 text-body font-medium ${
-            a.level === 'error'
-              ? 'border-danger/25 bg-danger/8 text-danger'
-              : 'border-warn/25 bg-warn/8 text-warn'
-          }`}
-          role="alert"
-        >
-          <span className="min-w-0 flex-1">{a.message}</span>
-          <button
-            onClick={() => setDismissed((prev) => new Set(prev).add(a.message))}
-            className="shrink-0 opacity-60 transition-opacity hover:opacity-100"
-            aria-label="Dismiss"
-          >
-            <IX size={14} />
-          </button>
-        </div>
-      ))}
-    </div>
-  )
 }
 
 // ── Shell ─────────────────────────────────────────────────────────────────────
@@ -93,12 +58,12 @@ export default function Shell({
           </div>
         </div>
 
-        <nav className="flex-1 space-y-0.5 px-3">
+        <nav aria-label="Main" className="flex-1 space-y-0.5 px-3">
           {NAV.map((item) => (
             <button
               key={item.id}
               onClick={() => onNavigate(item.id)}
-              className={`flex w-full items-center gap-2.5 whitespace-nowrap rounded-ctl px-3 py-2 text-body font-semibold transition-colors ${
+              className={`flex w-full items-center gap-2.5 whitespace-nowrap rounded-ctl px-3 py-2 text-body font-semibold transition-colors coarse:min-h-11 ${
                 group === item.id
                   ? 'bg-surface2 text-ink [&>svg]:text-accent'
                   : 'text-ink2 hover:bg-surface2 hover:text-ink'
@@ -114,7 +79,7 @@ export default function Shell({
         <div className="border-t border-line/8 px-5 py-3">
           <button
             onClick={onToggleTheme}
-            className="flex items-center gap-2 text-meta font-medium text-ink2 transition-colors hover:text-ink"
+            className="flex items-center gap-2 text-meta font-medium text-ink2 transition-colors hover:text-ink coarse:min-h-11"
           >
             {themeIcon}
             {theme === 'dark' ? 'Light mode' : 'Dark mode'}
@@ -132,14 +97,14 @@ export default function Shell({
           <span className="font-display text-base font-semibold tracking-[-0.01em] text-ink">{GROUP_TITLES[group]}</span>
           <button
             onClick={onToggleTheme}
-            className="flex h-8 w-8 items-center justify-center rounded-ctl text-ink2 transition-colors hover:bg-surface2 hover:text-ink"
+            className="flex h-8 w-8 items-center justify-center rounded-ctl text-ink2 transition-colors hover:bg-surface2 hover:text-ink coarse:h-11 coarse:w-11"
             aria-label="Toggle theme"
           >
             {themeIcon}
           </button>
         </header>
 
-        <main className="min-h-0 flex-1 overflow-y-auto">
+        <main tabIndex={-1} className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-shell px-4 pb-24 pt-4 lg:px-6 lg:pb-10 lg:pt-6">
             <AlertBanner />
             <Suspense
@@ -156,6 +121,7 @@ export default function Shell({
 
         {/* Mobile bottom tabs */}
         <nav
+          aria-label="Main"
           className="fixed inset-x-0 bottom-0 z-30 border-t border-line/8 bg-surface lg:hidden"
           style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
         >
@@ -166,7 +132,7 @@ export default function Shell({
                 <button
                   key={item.id}
                   onClick={() => onNavigate(item.id)}
-                  className={`-mt-px flex flex-1 flex-col items-center gap-0.5 border-t-2 pb-1.5 pt-2 text-caption font-semibold transition-colors ${
+                  className={`focus-inset -mt-px flex min-h-11 min-w-11 flex-1 flex-col items-center gap-0.5 border-t-2 pb-1.5 pt-2 text-caption font-semibold transition-colors ${
                     active ? 'border-accent text-ink [&>svg]:text-accent' : 'border-transparent text-ink3 hover:text-ink2'
                   }`}
                   aria-current={active ? 'page' : undefined}

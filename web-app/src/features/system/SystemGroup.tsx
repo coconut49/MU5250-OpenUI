@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Tabs } from '../../ui/Tabs'
+import { TabPanel, Tabs } from '../../ui/Tabs'
 import MetricsTab from './MetricsTab'
 import ToolsTab from './ToolsTab'
 import SettingsTab from './SettingsTab'
@@ -24,11 +24,15 @@ export default function SystemGroup({ onLogout }: { onLogout: () => void }) {
         ]}
         active={tab}
         onChange={setTab}
+        label="System sections"
+        idBase="system"
       />
 
-      {tab === 'metrics' && <MetricsTab />}
-      {tab === 'tools' && <ToolsTab />}
-      {tab === 'settings' && <SettingsTab onLogout={onLogout} />}
+      <TabPanel idBase="system" id={tab} className="space-y-4">
+        {tab === 'metrics' && <MetricsTab />}
+        {tab === 'tools' && <ToolsTab />}
+        {tab === 'settings' && <SettingsTab onLogout={onLogout} />}
+      </TabPanel>
     </div>
   )
 }

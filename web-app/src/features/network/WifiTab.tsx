@@ -1,163 +1,127 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useId, useRef, useState, type ReactNode } from 'react'
 import { api } from '../../data/api'
-import type { WifiAll, WifiBand } from '../../types'
+import { useResource } from '../../data/poll'
+import type { WifiBand } from '../../types'
 import { Button, Field, Input, Select, Toggle } from '../../ui/controls'
-import { toast, toastError } from '../../ui/feedback'
-import { Card, Chip, Skeleton } from '../../ui/primitives'
+import { confirm, toastError, type ConfirmOptions } from '../../ui/feedback'
+import { Card, Chip, InlineStatus, Loading, Skeleton, Unavailable } from '../../ui/primitives'
+import { getBandInsights } from './wifiAdvice'
+import { bandSaveConfirm, masterOffConfirm, radioOffConfirm, syncConfirm } from './wifiConfirm'
+import {
+  buildBandPatch,
+  buildSyncPatch,
+  cancelDraft,
+  draftFromBand,
+  editDraft,
+  formatBandwidthMode,
+  hasErrors,
+  initDraft,
+  isDirty,
+  isUncertainFailure,
+  normalizeConfiguredChannel,
+  parseTxPower,
+  reconcileDraft,
+  reloadDraft,
+  startEditing,
+  validateDraft,
+  verifyApplied,
+  type BandDraft,
+  type BandSuffix,
+  type WifiPatch,
+} from './wifiDraft'
 
-const DFS_5G_CHANNELS = new Set(['52', '56', '60', '64', '100', '104', '108', '112', '116', '120', '124', '128', '132', '136', '140', '144'])
+const CHANNELS_2G = ['auto', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']
+const CHANNELS_5G = [
+  'auto', '36', '40', '44', '48', '52', '56', '60', '64', '100', '104', '108', '112', '116', '120',
+  '124', '128', '132', '136', '140', '144', '149', '153', '157', '161', '165',
+]
 
-function normalizeConfiguredChannel(channel?: string) {
-  const raw = (channel ?? '').trim().toLowerCase()
-  return !raw || raw === '0' || raw === 'auto' ? 'auto' : raw
-}
-
-function formatBandwidthMode(mode?: string) {
-  if (!mode) return '\u2014'
-  if (/^(EHT|HE|VHT|HT)\d+$/.test(mode)) return `${mode.replace(/^(EHT|HE|VHT|HT)/, '')} MHz (${mode.match(/^(EHT|HE|VHT|HT)/)?.[0]})`
-  return mode
-}
-
-function getBandInsights(suffix: '2g' | '5g', band: WifiBand): string[] {
-  const insights: string[] = []
-  const configuredChannel = normalizeConfiguredChannel(band.configuredChannel)
-  const actualChannel = band.actualChannel ?? band.channel
-
-  if (configuredChannel === 'auto' && actualChannel != null) {
-    insights.push(`Auto channel selected ${actualChannel} at runtime.`)
-  }
-  if (configuredChannel !== 'auto') {
-    const configuredNum = parseInt(configuredChannel, 10)
-    if (!Number.isNaN(configuredNum)) {
-      if (actualChannel != null && configuredNum !== actualChannel) {
-        insights.push(`Configured channel ${configuredNum}, currently operating on ${actualChannel}.`)
-      }
-      if (suffix === '2g' && ![1, 6, 11].includes(configuredNum)) {
-        insights.push('2.4 GHz usually performs best on channels 1, 6, or 11 to reduce overlap.')
-      }
-      if (suffix === '5g' && DFS_5G_CHANNELS.has(String(configuredNum))) {
-        insights.push('DFS channel selected — radar events can force channel changes.')
-      }
-    }
-  }
-  const configuredBw = (band.configuredBandwidth ?? '').toUpperCase()
-  const actualBw = (band.actualBandwidth ?? band.bandwidth ?? '').toUpperCase()
-  if (configuredBw && actualBw && configuredBw !== actualBw) {
-    insights.push(`Configured bandwidth ${configuredBw}, runtime reports ${actualBw}.`)
-  }
-  if ((band.clients ?? 0) >= 15) {
-    insights.push('High client count detected. Fixed channels can improve stability.')
-  }
-  return insights
-}
+/** Submit one reviewed payload. Resolves true only when the device acknowledged it. */
+type ApplyFn = (patch: WifiPatch, what: string, review?: ConfirmOptions) => Promise<boolean>
 
 // ── Band card ─────────────────────────────────────────────────────────────────
 
 function BandCard({
   label,
+  other,
   band,
   suffix,
   masterEnabled,
-  onRefresh,
+  locked,
+  apply,
 }: {
   label: string
+  other: string
   band: WifiBand
-  suffix: '2g' | '5g'
+  suffix: BandSuffix
   masterEnabled: boolean
-  onRefresh: () => void
+  locked: boolean
+  apply: ApplyFn
 }) {
-  const [editing, setEditing] = useState(false)
-  const [ssid, setSsid] = useState('')
-  const [password, setPassword] = useState('')
-  const [passwordDirty, setPasswordDirty] = useState(false)
-  const [channel, setChannel] = useState('')
-  const [htmode, setHtmode] = useState('')
-  const [txpower, setTxpower] = useState('')
-  const [hidden, setHidden] = useState(false)
-  const [busy, setBusy] = useState(false)
+  // The draft lives here, not in the status data: a Wi-Fi re-read (or a sibling band's save) hands
+  // us a new `band` object, but only a real change to this band's settings reaches the draft (R03).
+  const observed = draftFromBand(band)
+  const [state, setState] = useState(() => initDraft(observed))
+  const current = reconcileDraft(state, observed)
+  if (current !== state) setState(current)
+  const { editing, draft, base, conflict } = current
+  const dirty = isDirty(current)
 
-  useEffect(() => {
-    setSsid(band.ssid ?? '')
-    setPassword(band.password ?? '')
-    setPasswordDirty(false)
-    setChannel(normalizeConfiguredChannel(band.configuredChannel))
-    setHtmode(band.configuredBandwidth ?? '')
-    setTxpower('')
-    setHidden(band.hidden)
-  }, [band])
+  const [saving, setSaving] = useState(false)
+  const ids = useId()
+  const hiddenId = `${ids}-hidden`
+  const set = (patch: Partial<BandDraft>) => setState((s) => editDraft(s, patch))
+
+  const errors = validateDraft(draft, base, band.security)
+  const patch = buildBandPatch(suffix, draft, base)
+  const canSave = dirty && !hasErrors(errors) && Object.keys(patch).length > 0 && !locked
 
   async function handleSave() {
-    setBusy(true)
+    if (!canSave) return
+    // Freeze what was reviewed: later edits or re-reads cannot change this payload.
+    const frozen = buildBandPatch(suffix, draft, base)
+    setSaving(true)
     try {
-      const settings: Record<string, unknown> = {
-        [`ssid_${suffix}`]: ssid,
-        [`hidden_${suffix}`]: hidden ? '1' : '0',
-      }
-      if (passwordDirty) settings[`key_${suffix}`] = password
-      if (channel && channel !== normalizeConfiguredChannel(band.configuredChannel)) settings[`channel_${suffix}`] = channel
-      if (htmode && htmode !== band.configuredBandwidth) settings[`htmode_${suffix}`] = htmode
-      if (txpower) settings[`txpower_${suffix}`] = txpower
-      await api.wifiSet(settings)
-      toast('Saved — Wi-Fi may reconnect')
-      setPasswordDirty(false)
-      setEditing(false)
-      onRefresh()
-    } catch (e) {
-      toastError(e, 'Save failed')
+      const ok = await apply(frozen, `${label} settings`, bandSaveConfirm(label, other, frozen, band))
+      if (ok) setState((s) => cancelDraft(s))
     } finally {
-      setBusy(false)
+      setSaving(false)
     }
   }
 
   async function toggleRadio() {
-    setBusy(true)
-    try {
-      const key = suffix === '2g' ? 'radio2_disabled' : 'radio5_disabled'
-      await api.wifiSet({ [key]: band.enabled ? '1' : '0' })
-      toast(band.enabled ? 'Radio disabled' : 'Radio enabled')
-      onRefresh()
-    } catch (e) {
-      toastError(e)
-    } finally {
-      setBusy(false)
-    }
+    const turningOff = band.enabled
+    const key = suffix === '2g' ? 'radio2_disabled' : 'radio5_disabled'
+    const frozen = Object.freeze({ [key]: turningOff ? '1' : '0' })
+    await apply(frozen, `${label} radio`, turningOff ? radioOffConfirm(label, other) : undefined)
   }
 
-  const channels =
-    suffix === '2g'
-      ? ['auto', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']
-      : ['auto', '36', '40', '44', '48', '52', '56', '60', '64', '100', '104', '108', '112', '116', '120', '124', '128', '132', '136', '140', '144', '149', '153', '157', '161', '165']
-  const htmodes = band.bandwidthOptions?.length ? band.bandwidthOptions : [band.configuredBandwidth].filter(Boolean) as string[]
-  const configuredChannel = normalizeConfiguredChannel(band.configuredChannel)
+  const channels = [...(suffix === '2g' ? CHANNELS_2G : CHANNELS_5G)]
+  if (draft.channel && !channels.includes(draft.channel)) channels.push(draft.channel)
+  const htmodes = [...(band.bandwidthOptions ?? [])]
+  for (const m of [base.htmode, draft.htmode]) if (m && !htmodes.includes(m)) htmodes.push(m)
+
   const insights = getBandInsights(suffix, band)
+  const configuredChannel = normalizeConfiguredChannel(band.configuredChannel)
+  const currentChannel = band.actualChannel ?? band.channel
+  const currentWidth = band.actualBandwidth ?? band.bandwidth
+  const txKnown = band.txpowerPercent != null
+  const tx = parseTxPower(draft.txpower)
 
   return (
     <Card
       title={label}
       action={
         !editing ? (
-          <Button size="sm" variant="ghost" onClick={() => setEditing(true)}>
+          <Button size="sm" variant="ghost" aria-label={`Edit ${label} settings`} onClick={() => setState(startEditing)}>
             Edit
           </Button>
         ) : (
           <div className="flex gap-1.5">
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                setEditing(false)
-                setSsid(band.ssid ?? '')
-                setPassword(band.password ?? '')
-                setPasswordDirty(false)
-                setChannel(normalizeConfiguredChannel(band.configuredChannel))
-                setHtmode(band.configuredBandwidth ?? '')
-                setTxpower('')
-                setHidden(band.hidden)
-              }}
-            >
+            <Button size="sm" variant="ghost" aria-label={`Cancel editing ${label}`} onClick={() => setState(cancelDraft)} disabled={saving}>
               Cancel
             </Button>
-            <Button size="sm" variant="primary" onClick={handleSave} loading={busy}>
+            <Button size="sm" variant="primary" aria-label={`Save ${label} settings`} onClick={handleSave} loading={saving} disabled={!canSave}>
               Save
             </Button>
           </div>
@@ -165,10 +129,11 @@ function BandCard({
       }
     >
       <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
             <span
-              className={`h-2 w-2 rounded-full ${masterEnabled ? (band.enabled ? 'bg-ok' : 'bg-danger') : 'bg-warn'}`}
+              aria-hidden="true"
+              className={`h-2 w-2 shrink-0 rounded-full ${masterEnabled ? (band.enabled ? 'bg-ok' : 'bg-danger') : 'bg-warn'}`}
             />
             <span className="text-body text-ink2">
               {masterEnabled ? (band.enabled ? 'Enabled' : 'Disabled') : 'Master off'}
@@ -179,30 +144,31 @@ function BandCard({
               </span>
             )}
           </div>
-          <Toggle checked={band.enabled} onChange={toggleRadio} disabled={busy} label={`Toggle ${label} radio`} />
+          <Toggle checked={band.enabled} onChange={toggleRadio} disabled={locked} label={`${label} radio`} />
         </div>
-        {!masterEnabled && (
-          <p className="text-meta text-warn">Global Wi-Fi is off. Band settings are still saved.</p>
-        )}
+        {!masterEnabled && <p className="text-meta text-warn">Global Wi-Fi is off. Band settings are still saved.</p>}
 
         {editing ? (
           <>
-            <Field label="SSID">
-              <Input value={ssid} onChange={(e) => setSsid(e.target.value)} />
+            {dirty && (
+              <div>
+                <Chip tone="warn">Unsaved changes</Chip>
+              </div>
+            )}
+            {conflict && (
+              <InlineStatus kind="warn" action={{ label: 'Reload from device', onClick: () => setState(reloadDraft) }}>
+                The device changed this band&apos;s settings while you were editing. Your edits are kept; reload to discard them.
+              </InlineStatus>
+            )}
+            <Field label="SSID" error={errors.ssid}>
+              <Input value={draft.ssid} onChange={(e) => set({ ssid: e.target.value })} autoComplete="off" />
             </Field>
-            <Field label="Password" hint="Leave unchanged to keep the current password">
-              <Input
-                type="password"
-                value={password}
-                onChange={(e) => {
-                  setPassword(e.target.value)
-                  setPasswordDirty(true)
-                }}
-              />
+            <Field label="Password" hint="Leave unchanged to keep the current password" error={errors.password}>
+              <Input type="password" value={draft.password} onChange={(e) => set({ password: e.target.value })} autoComplete="new-password" />
             </Field>
-            <div className="grid grid-cols-2 gap-2 border-t border-line/8 pt-3">
+            <div className="grid grid-cols-1 gap-2 border-t border-line/8 pt-3 sm:grid-cols-2">
               <Field label="Channel">
-                <Select value={channel} onChange={(e) => setChannel(e.target.value)}>
+                <Select value={draft.channel} onChange={(e) => set({ channel: e.target.value })}>
                   {channels.map((c) => (
                     <option key={c} value={c}>
                       {c === 'auto' ? 'Auto' : c}
@@ -211,7 +177,7 @@ function BandCard({
                 </Select>
               </Field>
               <Field label="Bandwidth">
-                <Select value={htmode} onChange={(e) => setHtmode(e.target.value)}>
+                <Select value={draft.htmode} onChange={(e) => set({ htmode: e.target.value })}>
                   {htmodes.map((m) => (
                     <option key={m} value={m}>
                       {formatBandwidthMode(m)}
@@ -219,45 +185,61 @@ function BandCard({
                   ))}
                 </Select>
               </Field>
-              <Field label="TX power">
-                <Select value={txpower} onChange={(e) => setTxpower(e.target.value)}>
-                  <option value="">Default</option>
-                  <option value="100">100%</option>
-                  <option value="75">75%</option>
-                  <option value="50">50%</option>
-                  <option value="25">25%</option>
-                </Select>
+              <Field
+                label="TX power (%)"
+                hint={
+                  txKnown
+                    ? `Percent of maximum power, 1–100. Currently ${band.txpowerPercent}%. Clear the box to keep the current value.`
+                    : 'The current value is unknown. Leave blank to keep it, or enter 1–100.'
+                }
+                error={tx.ok ? undefined : tx.error}
+              >
+                {(f) => (
+                  <Input
+                    id={f.id}
+                    aria-describedby={f.describedBy}
+                    aria-invalid={f.invalid || undefined}
+                    inputMode="numeric"
+                    autoComplete="off"
+                    placeholder="Keep current"
+                    value={draft.txpower}
+                    onChange={(e) => set({ txpower: e.target.value })}
+                  />
+                )}
               </Field>
-              <div className="flex items-end gap-2 pb-1.5">
-                <Toggle checked={hidden} onChange={setHidden} label="Hidden SSID" />
-                <span className="text-meta font-medium text-ink2">Hidden SSID</span>
+              <div className="flex items-center gap-2 sm:items-end sm:pb-1.5">
+                <Toggle checked={draft.hidden} onChange={(hidden) => set({ hidden })} labelledBy={hiddenId} />
+                <span id={hiddenId} className="text-meta font-medium text-ink2">
+                  Hidden SSID
+                </span>
               </div>
             </div>
           </>
         ) : (
           <>
             <div className="grid grid-cols-2 gap-x-3 gap-y-2">
-              <Info label="SSID" value={band.ssid ?? '\u2014'} strong />
-              <Info label="Password" value={band.password ?? '\u2014'} mono />
-              <Info label="Channel" value={configuredChannel === 'auto' ? `Auto (${band.actualChannel ?? band.channel ?? '\u2014'})` : configuredChannel} />
-              <Info label="Bandwidth" value={formatBandwidthMode(band.configuredBandwidth)} />
-              <Info label="Security" value={band.security ?? '\u2014'} />
+              <Info label="SSID" value={band.ssid} strong />
+              <Info label="Password" value={band.password} mono />
+              <Info label="Configured channel" value={configuredChannel === 'auto' ? 'Auto' : configuredChannel} />
+              <Info label="Current channel" value={currentChannel != null ? String(currentChannel) : undefined} />
+              <Info label="Configured width" value={formatBandwidthMode(band.configuredBandwidth)} />
+              <Info label="Current width" value={currentWidth} />
+              <Info label="Configured TX power" value={txKnown ? `${band.txpowerPercent}%` : undefined} />
+              <Info label="Security" value={band.security} />
               <Info label="Hidden" value={band.hidden ? 'Yes' : 'No'} />
             </div>
-            <div className="rounded-ctl bg-surface2/70 px-3 py-2">
-              <p className="label mb-1">Channel insights</p>
-              {insights.length > 0 ? (
+            {insights.length > 0 && (
+              <div className="rounded-ctl bg-surface2/70 px-3 py-2">
+                <p className="label mb-1">Configuration notes</p>
                 <div className="space-y-1">
-                  {insights.map((insight, i) => (
-                    <p key={i} className="text-meta text-ink2">
+                  {insights.map((insight) => (
+                    <p key={insight} className="text-meta text-ink2">
                       {insight}
                     </p>
                   ))}
                 </div>
-              ) : (
-                <p className="text-meta text-ink3">No obvious channel conflicts detected.</p>
-              )}
-            </div>
+              </div>
+            )}
           </>
         )}
       </div>
@@ -265,12 +247,12 @@ function BandCard({
   )
 }
 
-function Info({ label, value, strong = false, mono = false }: { label: string; value: string; strong?: boolean; mono?: boolean }) {
+function Info({ label, value, strong = false, mono = false }: { label: string; value?: ReactNode; strong?: boolean; mono?: boolean }) {
   return (
     <div className="min-w-0">
       <p className="label">{label}</p>
-      <p className={`truncate text-body ${strong ? 'font-semibold text-ink' : 'text-ink2'} ${mono ? 'font-mono text-meta' : ''}`}>
-        {value}
+      <p className={`break-words text-body ${strong ? 'font-semibold text-ink' : 'text-ink2'} ${mono ? 'font-mono text-meta' : ''}`}>
+        {value == null || value === '' ? <Unavailable /> : value}
       </p>
     </div>
   )
@@ -278,126 +260,207 @@ function Info({ label, value, strong = false, mono = false }: { label: string; v
 
 // ── Tab ───────────────────────────────────────────────────────────────────────
 
+interface Notice {
+  kind: 'verifying' | 'verified' | 'mismatch' | 'unverified'
+  text: string
+  /** Read-only re-check; never repeats the change. */
+  check?: () => void
+}
+
 export default function WifiTab() {
-  const [wifi, setWifi] = useState<WifiAll | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [syncBusy, setSyncBusy] = useState(false)
+  const wifi = useResource('wifi:status', api.wifiStatus)
+  const [pending, setPending] = useState(false)
+  const [notice, setNotice] = useState<Notice | null>(null)
+  const lock = useRef(false)
+  const verifyId = useRef(0)
 
-  const refresh = useCallback(() => {
-    api.wifiStatus().then(setWifi).catch(() => {})
-  }, [])
-
-  useEffect(() => {
-    refresh()
-  }, [refresh])
-
-  async function toggleMaster() {
-    if (!wifi) return
-    const next = !wifi.master_enabled
-    setBusy(true)
+  /** Re-read the settings after an acknowledged (or uncertain) change and compare them with the request. */
+  async function verify(patch: WifiPatch, what: string, acknowledged = true) {
+    const id = ++verifyId.current
+    setNotice({
+      kind: 'verifying',
+      text: acknowledged
+        ? `${what}: applied. Wi-Fi may be reconnecting. Verifying the device's settings…`
+        : `${what}: checking the device's settings…`,
+    })
     try {
-      await api.wifiSet({ wifi_onoff: next ? '1' : '0' })
-      toast(next ? 'Global Wi-Fi enabled' : 'Global Wi-Fi disabled')
-      refresh()
-    } catch (e) {
-      toastError(e)
-    } finally {
-      setBusy(false)
+      const fresh = await api.wifiStatus()
+      if (id !== verifyId.current) return
+      wifi.mutate(fresh)
+      const v = verifyApplied(patch, fresh)
+      if (v.kind === 'mismatch') {
+        setNotice({
+          kind: 'mismatch',
+          text: `${what}: the device does not report the requested value yet (${v.fields.join(', ')}). Re-check in a moment.`,
+          check: () => void verify(patch, what, acknowledged),
+        })
+      } else {
+        setNotice({
+          kind: 'verified',
+          text:
+            v.kind === 'verified'
+              ? `${what}: the device now reports the new settings.`
+              : `${what}: settings re-read from the device. A changed password cannot be read back to compare.`,
+        })
+      }
+    } catch {
+      if (id !== verifyId.current) return
+      setNotice({
+        kind: 'unverified',
+        text: `${what}: the change was sent but the device's settings could not be read back. They are unverified. Reconnect if Wi-Fi dropped, then check again.`,
+        check: () => void verify(patch, what, acknowledged),
+      })
     }
   }
 
-  async function syncBands(source: '2g' | '5g') {
-    if (!wifi) return
-    const sourceBand = source === '2g' ? wifi.band_2g : wifi.band_5g
-    const sourceLabel = source === '2g' ? '2.4 GHz' : '5 GHz'
-    const targetSuffix = source === '2g' ? '5g' : '2g'
-    const targetLabel = source === '2g' ? '5 GHz' : '2.4 GHz'
-
-    if (!sourceBand.ssid) {
-      toast(`Cannot sync from ${sourceLabel}: source SSID is empty`, 'err')
-      return
-    }
-
-    const payload: Record<string, unknown> = {
-      [`ssid_${targetSuffix}`]: sourceBand.ssid,
-      [`hidden_${targetSuffix}`]: sourceBand.hidden ? '1' : '0',
-    }
-    if (sourceBand.security) payload[`encryption_${targetSuffix}`] = sourceBand.security
-    const includePassword = Boolean(sourceBand.password && sourceBand.password !== '••••••••')
-    if (includePassword) payload[`key_${targetSuffix}`] = sourceBand.password
-
-    setSyncBusy(true)
+  /**
+   * The single path for every wireless mutation: review first (when the change can drop clients),
+   * then submit exactly the reviewed payload once. A second call while one is open or in flight is
+   * ignored, never queued or retried.
+   */
+  const apply: ApplyFn = async (patch, what, review) => {
+    if (lock.current) return false
+    lock.current = true
     try {
-      await api.wifiSet(payload)
-      toast(`Copied ${sourceLabel} settings to ${targetLabel}${includePassword ? ' (including password)' : ''}`)
-      refresh()
-    } catch (e) {
-      toastError(e)
+      if (review && !(await confirm(review))) return false
+      setPending(true)
+      try {
+        await api.wifiSet({ ...patch })
+      } catch (e) {
+        if (isUncertainFailure(e)) {
+          // No reply: the device may or may not have applied it. Never auto-retry; offer a read-only check.
+          setNotice({
+            kind: 'unverified',
+            text: `${what}: no reply from the device. Wi-Fi may have restarted and the change may or may not have applied. Reconnect, then check the device's settings.`,
+            check: () => void verify(patch, what, false),
+          })
+        } else {
+          toastError(e, `${what} failed`)
+        }
+        return false
+      } finally {
+        setPending(false)
+      }
+      void verify(patch, what)
+      return true
     } finally {
-      setSyncBusy(false)
+      lock.current = false
     }
   }
 
-  if (!wifi) {
+  const data = wifi.data
+  if (!data) {
+    if (wifi.status === 'error') {
+      return (
+        <InlineStatus kind="error" action={{ label: 'Retry', onClick: wifi.refresh, loading: wifi.refreshing }}>
+          Could not read the Wi-Fi settings: {wifi.error}
+        </InlineStatus>
+      )
+    }
     return (
-      <div className="space-y-3">
+      <Loading label="Loading Wi-Fi settings" className="space-y-3">
         <Skeleton className="h-24" />
         <Skeleton className="h-72" />
-      </div>
+      </Loading>
     )
   }
 
+  async function toggleMaster() {
+    const turningOff = data!.master_enabled
+    const frozen = Object.freeze({ wifi_onoff: turningOff ? '0' : '1' })
+    await apply(frozen, 'Global Wi-Fi', turningOff ? masterOffConfirm() : undefined)
+  }
+
+  async function syncBands(source: BandSuffix) {
+    const sourceBand = source === '2g' ? data!.band_2g : data!.band_5g
+    const targetBand = source === '2g' ? data!.band_5g : data!.band_2g
+    const sourceLabel = source === '2g' ? '2.4 GHz' : '5 GHz'
+    const targetSuffix: BandSuffix = source === '2g' ? '5g' : '2g'
+    const targetLabel = source === '2g' ? '5 GHz' : '2.4 GHz'
+    const built = buildSyncPatch(sourceBand, targetSuffix)
+    if ('error' in built) {
+      toastError(new Error(`Cannot sync from ${sourceLabel}: ${built.error}`))
+      return
+    }
+    await apply(
+      built.patch,
+      `Copy ${sourceLabel} to ${targetLabel}`,
+      syncConfirm(sourceLabel, targetLabel, built.patch, targetBand, built.includePassword),
+    )
+  }
+
+  const noticeKind = { verifying: 'info', verified: 'ok', mismatch: 'warn', unverified: 'warn' } as const
+
   return (
     <div className="space-y-3">
+      {wifi.status === 'stale' && (
+        <InlineStatus kind="stale" action={{ label: 'Retry', onClick: wifi.refresh, loading: wifi.refreshing }}>
+          Showing the last Wi-Fi settings that loaded. The latest read failed: {wifi.error}
+        </InlineStatus>
+      )}
+      {notice && (
+        <InlineStatus
+          kind={noticeKind[notice.kind]}
+          action={notice.check ? { label: 'Check device', onClick: notice.check } : undefined}
+        >
+          {notice.text}
+        </InlineStatus>
+      )}
+
       <Card title="Global Wi-Fi">
         <div className="flex items-center justify-between gap-3">
-          <div>
+          <div className="min-w-0">
             <p className="text-body font-medium text-ink">Master switch</p>
             <p className="mt-0.5 text-meta text-ink2">
-              {!wifi.master_supported
+              {!data.master_supported
                 ? 'This firmware does not expose a reliable global Wi-Fi toggle.'
-                : wifi.master_enabled
+                : data.master_enabled
                   ? 'On — radios follow your per-band settings'
                   : 'Off — all Wi-Fi radios are globally disabled'}
             </p>
           </div>
-          <Toggle checked={wifi.master_enabled} onChange={toggleMaster} disabled={busy || !wifi.master_supported} label="Master Wi-Fi switch" />
+          <Toggle
+            checked={data.master_enabled}
+            onChange={toggleMaster}
+            disabled={pending || !data.master_supported}
+            label="Master Wi-Fi switch"
+          />
         </div>
-        {wifi.wifi6_supported && (
+        {data.wifi6_supported && (
           <div className="mt-3 border-t border-line/8 pt-3">
-            <Chip tone={wifi.wifi6_enabled ? 'ok' : 'default'}>Wi-Fi 6 {wifi.wifi6_enabled ? 'enabled' : 'disabled'}</Chip>
+            <Chip tone={data.wifi6_enabled ? 'ok' : 'default'}>Wi-Fi 6 {data.wifi6_enabled ? 'enabled' : 'disabled'}</Chip>
           </div>
         )}
-        {wifi.wifi7_supported && (
+        {data.wifi7_supported && (
           <div className="mt-3 border-t border-line/8 pt-3">
-            <Chip tone="ok">Wi-Fi 7 / 802.11be supported</Chip>
+            <Chip tone="ok" wrap>
+              Wi-Fi 7 / 802.11be supported
+            </Chip>
           </div>
         )}
       </Card>
 
       <Card title="Band sync">
-        <p className="mb-2.5 text-meta text-ink2">
-          Copy SSID, password, security and hidden-state from one band to the other.
-        </p>
+        <p className="mb-2.5 text-meta text-ink2">Copy SSID, password, security and hidden-state from one band to the other.</p>
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" onClick={() => syncBands('2g')} loading={syncBusy}>
+          <Button variant="outline" onClick={() => syncBands('2g')} disabled={pending}>
             Use 2.4 GHz for both
           </Button>
-          <Button variant="outline" onClick={() => syncBands('5g')} loading={syncBusy}>
+          <Button variant="outline" onClick={() => syncBands('5g')} disabled={pending}>
             Use 5 GHz for both
           </Button>
         </div>
       </Card>
 
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-        <BandCard label="2.4 GHz" band={wifi.band_2g} suffix="2g" masterEnabled={wifi.master_enabled} onRefresh={refresh} />
-        <BandCard label="5 GHz" band={wifi.band_5g} suffix="5g" masterEnabled={wifi.master_enabled} onRefresh={refresh} />
+        <BandCard label="2.4 GHz" other="5 GHz" band={data.band_2g} suffix="2g" masterEnabled={data.master_enabled} locked={pending} apply={apply} />
+        <BandCard label="5 GHz" other="2.4 GHz" band={data.band_5g} suffix="5g" masterEnabled={data.master_enabled} locked={pending} apply={apply} />
       </div>
 
-      {wifi.guest_ssid && (
+      {data.guest_ssid && (
         <Card title="Guest network">
-          <p className="text-body text-ink2">
-            SSID: <span className="font-semibold text-ink">{wifi.guest_ssid}</span>
+          <p className="break-words text-body text-ink2">
+            SSID: <span className="font-semibold text-ink">{data.guest_ssid}</span>
           </p>
         </Card>
       )}

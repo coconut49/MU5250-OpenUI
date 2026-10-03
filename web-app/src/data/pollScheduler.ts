@@ -1,9 +1,23 @@
+/**
+ * - `loading`: no data yet and no failure (first read pending, or disabled).
+ * - `ready`: the last read succeeded (the data may be a genuinely empty list).
+ * - `error`: the first read failed; there is nothing to show.
+ * - `stale`: a later read failed; `data` is the last good value.
+ */
+export type ResourceStatus = 'loading' | 'ready' | 'error' | 'stale'
+
+export function resourceStatus(data: unknown, error: string | null): ResourceStatus {
+  if (error != null) return data == null ? 'error' : 'stale'
+  return data == null ? 'loading' : 'ready'
+}
+
 interface PollOptions<T> {
   read: () => Promise<T>
   publish: (value: T) => void
   error: (message: string) => void
   refreshing: (value: boolean) => void
-  interval: () => number
+  /** Delay before the next read; `null` reads once and then only on refresh(). */
+  interval: () => number | null
   visible: () => boolean
 }
 
@@ -13,6 +27,8 @@ export class PollScheduler<T> {
   private busy = false
   private revision = 0
   private pendingRefresh = false
+  /** A one-shot resource (interval `null`) still owes a read. */
+  private due = true
   private timer: ReturnType<typeof setTimeout> | undefined
 
   private readonly options: PollOptions<T>
@@ -21,6 +37,7 @@ export class PollScheduler<T> {
 
   start() {
     this.active = true
+    this.due = true
     this.wake()
   }
 
@@ -33,13 +50,17 @@ export class PollScheduler<T> {
 
   wake() {
     clearTimeout(this.timer)
-    if (this.active && this.options.visible() && !this.busy) void this.run()
+    if (!this.active || !this.options.visible() || this.busy) return
+    // Returning to the page re-reads a poll, but not a one-shot read that already ran.
+    if (this.options.interval() == null && !this.due) return
+    void this.run()
   }
 
   refresh() {
     if (!this.active) return
     this.revision++
     this.pendingRefresh = true
+    this.due = true
     this.options.refreshing(true)
     this.wake()
   }
@@ -54,6 +75,7 @@ export class PollScheduler<T> {
     if (!this.active || this.busy || !this.options.visible()) return
     this.busy = true
     this.pendingRefresh = false
+    this.due = false
     const revision = this.revision
     try {
       const value = await this.options.read()
@@ -66,9 +88,10 @@ export class PollScheduler<T> {
       this.busy = false
       if (this.active) {
         if (!this.pendingRefresh) this.options.refreshing(false)
-        if (this.options.visible()) {
+        const delay = this.pendingRefresh ? 0 : this.options.interval()
+        if (delay != null && this.options.visible()) {
           // Visibility changes never create a second owner while read() is pending.
-          this.timer = setTimeout(() => void this.run(), this.pendingRefresh ? 0 : this.options.interval())
+          this.timer = setTimeout(() => void this.run(), delay)
         }
       }
     }

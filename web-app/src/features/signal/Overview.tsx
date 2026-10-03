@@ -1,65 +1,16 @@
-import { useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
 import { useHome } from '../../app/HomeContext'
-import { formatBandwidthMHz, qualityText, rsrpQuality, rsrqColorClass, sinrColorClass, sumBandwidthMHz } from '../../format'
+import { signalLegend, toneTextClass } from '../../data/signalQuality'
+import type { SignalMetric } from '../../data/signalQuality'
+import { formatBandwidthMHz } from '../../format'
 import type { CarrierComponent } from '../../types'
-import { Card, Chip, SignalBars, Skeleton } from '../../ui/primitives'
-
-// ── Tooltip ───────────────────────────────────────────────────────────────────
-
-const TIP_WIDTH = 224
-
-function Tip({ text, children }: { text: string; children: React.ReactNode }) {
-  const ref = useRef<HTMLSpanElement>(null)
-  const [pos, setPos] = useState<{ x: number; top: number; bottom: number } | null>(null)
-
-  const measure = () => {
-    const r = ref.current?.getBoundingClientRect()
-    return r ? { x: r.left + r.width / 2, top: r.top, bottom: r.bottom } : null
-  }
-
-  const half = TIP_WIDTH / 2
-  const left = pos ? Math.min(Math.max(pos.x, half + 8), window.innerWidth - half - 8) : 0
-  const below = pos ? pos.top < 130 : false
-
-  return (
-    <span
-      ref={ref}
-      className="cursor-help"
-      onMouseEnter={() => setPos(measure())}
-      onMouseLeave={() => setPos(null)}
-      onTouchStart={() => setPos((p) => (p ? null : measure()))}
-    >
-      {children}
-      {pos &&
-        createPortal(
-          <span
-            role="tooltip"
-            className="fixed z-50 w-56 rounded-ctl border border-line/10 bg-surface px-2.5 py-1.5 text-caption leading-snug text-ink2 shadow-lg"
-            style={
-              below
-                ? { left, top: pos.bottom + 8 }
-                : { left, top: pos.top - 8, transform: 'translateY(-100%)' }
-            }
-          >
-            {text}
-          </span>,
-          document.body,
-        )}
-    </span>
-  )
-}
-
-const RSRP_TIP =
-  'Reference Signal Received Power — power of a single LTE/NR reference signal. Primary indicator of signal strength.'
-const RSRQ_TIP =
-  'Reference Signal Received Quality — signal quality accounting for noise and interference from neighbouring cells.'
-const SINR_TIP =
-  'Signal to Interference plus Noise Ratio — how far the signal is above the noise floor. Key metric for achievable throughput.'
-const RSSI_TIP =
-  'Received Signal Strength Indicator — total wideband received power including signal, noise, and interference.'
+import { Card, Chip, SignalBars, Skeleton, Unavailable } from '../../ui/primitives'
+import { MetricValue } from './MetricValue'
+import { Tip } from './Tip'
+import { METRIC_HELP, METRIC_LABEL, RATING_NOTE, bandwidthSummary, barsText, carrierCounts, servingView } from './telemetryView'
 
 // ── Carrier table (desktop) / cards (mobile) ──────────────────────────────────
+
+const METRICS: SignalMetric[] = ['rsrp', 'rsrq', 'sinr', 'rssi']
 
 function CarrierStatus({ carrier, empty = null }: { carrier: CarrierComponent; empty?: React.ReactNode }) {
   if (carrier.ul_configured === undefined && carrier.active === undefined) return empty
@@ -67,13 +18,18 @@ function CarrierStatus({ carrier, empty = null }: { carrier: CarrierComponent; e
   return (
     <span className="flex flex-wrap gap-1">
       {carrier.ul_configured !== undefined && (
-        <Chip tone={carrier.ul_configured ? 'ok' : 'default'}>UL {carrier.ul_configured ? '\u2713' : '\u2717'}</Chip>
+        <Chip tone={carrier.ul_configured ? 'ok' : 'default'}>UL {carrier.ul_configured ? '✓' : '✗'}</Chip>
       )}
       {carrier.active !== undefined && (
         <Chip tone={carrier.active ? 'ok' : 'default'}>{carrier.active ? 'Active' : 'Idle'}</Chip>
       )}
     </span>
   )
+}
+
+function Pci({ pci }: { pci?: number }) {
+  // PCI 0 is a real value; only an absent PCI is unavailable.
+  return pci === undefined ? <Unavailable /> : <>{pci}</>
 }
 
 function CarrierTable({ carriers, tech }: { carriers: CarrierComponent[]; tech: 'NR' | 'LTE' }) {
@@ -100,26 +56,11 @@ function CarrierTable({ carriers, tech }: { carriers: CarrierComponent[]; tech: 
               <th className="pb-1.5 pr-3 font-semibold">{isNR ? 'ARFCN' : 'EARFCN'}</th>
               <th className="pb-1.5 pr-3 font-semibold">BW</th>
               <th className="pb-1.5 pr-3 font-semibold">Freq</th>
-              <th className="pb-1.5 pr-3 font-semibold">
-                <Tip text={RSRP_TIP}>
-                  <span className="underline decoration-dotted underline-offset-2">RSRP</span>
-                </Tip>
-              </th>
-              <th className="pb-1.5 pr-3 font-semibold">
-                <Tip text={RSRQ_TIP}>
-                  <span className="underline decoration-dotted underline-offset-2">RSRQ</span>
-                </Tip>
-              </th>
-              <th className="pb-1.5 pr-3 font-semibold">
-                <Tip text={SINR_TIP}>
-                  <span className="underline decoration-dotted underline-offset-2">SINR</span>
-                </Tip>
-              </th>
-              <th className="pb-1.5 font-semibold">
-                <Tip text={RSSI_TIP}>
-                  <span className="underline decoration-dotted underline-offset-2">RSSI</span>
-                </Tip>
-              </th>
+              {METRICS.map((m, i) => (
+                <th key={m} className={`pb-1.5 font-semibold ${i < METRICS.length - 1 ? 'pr-3' : ''}`}>
+                  <Tip text={METRIC_HELP[m]}>{METRIC_LABEL[m]}</Tip>
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
@@ -135,24 +76,19 @@ function CarrierTable({ carriers, tech }: { carriers: CarrierComponent[]; tech: 
                   </td>
                   <td className={`py-1.5 pr-3 font-semibold ${bandText}`}>{c.band}</td>
                   <td className="py-1.5 pr-3 text-ink3">
-                    <CarrierStatus carrier={c} empty={'\u2014'} />
+                    <CarrierStatus carrier={c} empty={'—'} />
                   </td>
-                  <td className="tnum font-mono py-1.5 pr-3 text-ink">{c.pci}</td>
+                  <td className="tnum font-mono py-1.5 pr-3 text-ink"><Pci pci={c.pci} /></td>
                   <td className="tnum font-mono py-1.5 pr-3 text-ink">{c.earfcn}</td>
                   <td className="tnum font-mono py-1.5 pr-3 text-ink2">{c.bandwidth}</td>
                   <td className="tnum font-mono py-1.5 pr-3 text-ink2">
-                    {c.freq ? `${c.freq.toFixed(1)} MHz` : '\u2014'}
+                    {c.freq ? `${c.freq.toFixed(1)} MHz` : '—'}
                   </td>
-                  <td className={`tnum font-mono py-1.5 pr-3 font-semibold ${qualityText(rsrpQuality(c.rsrp))}`}>
-                    {c.rsrp ?? '\u2014'}
-                  </td>
-                  <td className={`tnum font-mono py-1.5 pr-3 font-medium ${rsrqColorClass(c.rsrq)}`}>
-                    {c.rsrq ?? '\u2014'}
-                  </td>
-                  <td className={`tnum font-mono py-1.5 pr-3 font-medium ${sinrColorClass(c.sinr)}`}>
-                    {c.sinr ?? '\u2014'}
-                  </td>
-                  <td className="tnum font-mono py-1.5 text-ink2">{c.rssi ?? '\u2014'}</td>
+                  {METRICS.map((m, k) => (
+                    <td key={m} className={`py-1.5 align-top font-medium ${k < METRICS.length - 1 ? 'pr-3' : ''}`}>
+                      <MetricValue metric={m} value={c[m]} />
+                    </td>
+                  ))}
                 </tr>
               )
             })}
@@ -160,16 +96,10 @@ function CarrierTable({ carriers, tech }: { carriers: CarrierComponent[]; tech: 
         </table>
       </div>
 
-      {/* Mobile cards */}
+      {/* Mobile cards: the same readings, ratings and help as the table */}
       <div className="space-y-2 sm:hidden">
         {sorted.map((c, i) => {
           const isPcc = c.label === 'PCC'
-          const metrics = [
-            { label: 'RSRP', value: c.rsrp, cls: qualityText(rsrpQuality(c.rsrp)) },
-            { label: 'RSRQ', value: c.rsrq, cls: rsrqColorClass(c.rsrq) },
-            { label: 'SINR', value: c.sinr, cls: sinrColorClass(c.sinr) },
-            { label: 'RSSI', value: c.rssi, cls: 'text-ink2' },
-          ]
           return (
             <div
               key={i}
@@ -183,15 +113,23 @@ function CarrierTable({ carriers, tech }: { carriers: CarrierComponent[]; tech: 
                 </div>
               </div>
               <div className="grid grid-cols-4 gap-2">
-                {metrics.map((m) => (
-                  <div key={m.label}>
-                    <p className="label">{m.label}</p>
-                    <p className={`tnum font-mono text-sm font-bold ${m.cls}`}>{m.value ?? '\u2014'}</p>
+                {METRICS.map((m) => (
+                  <div key={m} className="min-w-0">
+                    <p>
+                      <Tip text={METRIC_HELP[m]} className="label">
+                        {METRIC_LABEL[m]}
+                      </Tip>
+                    </p>
+                    <p className="text-sm font-bold">
+                      <MetricValue metric={m} value={c[m]} />
+                    </p>
                   </div>
                 ))}
               </div>
               <div className="tnum font-mono mt-2 flex flex-wrap gap-x-4 gap-y-1 border-t border-line/8 pt-2 text-caption text-ink3">
-                <span>PCI {c.pci}</span>
+                <span>
+                  PCI <Pci pci={c.pci} />
+                </span>
                 <span>
                   {isNR ? 'ARFCN' : 'EARFCN'} {c.earfcn}
                 </span>
@@ -203,6 +141,37 @@ function CarrierTable({ carriers, tech }: { carriers: CarrierComponent[]; tech: 
         })}
       </div>
     </div>
+  )
+}
+
+// ── Legend (generated from the policy) ────────────────────────────────────────
+
+const LEGEND: { metric: SignalMetric; title: string }[] = [
+  { metric: 'rsrp', title: 'RSRP (dBm)' },
+  { metric: 'rsrq', title: 'RSRQ (dB)' },
+  { metric: 'sinr', title: 'SINR (dB)' },
+]
+
+function Legend() {
+  return (
+    <Card title="Signal quality reference">
+      <div className="grid grid-cols-1 gap-4 text-body md:grid-cols-3">
+        {LEGEND.map(({ metric, title }) => (
+          <div key={metric} data-legend={metric}>
+            <p className="mb-1.5 font-semibold text-ink">{title}</p>
+            <ul className="space-y-0.5 text-ink2">
+              {signalLegend(metric).map((row) => (
+                <li key={row.level} data-level={row.level} className="flex justify-between gap-3">
+                  <span className={toneTextClass(row.tone)}>{row.label}</span>
+                  <span className="tnum font-mono text-ink3">{row.range}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 text-meta text-ink3">{RATING_NOTE}</p>
+    </Card>
   )
 }
 
@@ -233,9 +202,17 @@ export default function Overview() {
 
   const hasNR = data.nr_carriers.length > 0
   const hasLTE = data.lte_carriers.length > 0
-  const nrBw = sumBandwidthMHz(data.nr_carriers)
-  const lteBw = sumBandwidthMHz(data.lte_carriers)
-  const totalBw = nrBw + lteBw
+  const nr = carrierCounts(data.nr_carriers)
+  const lte = carrierCounts(data.lte_carriers)
+  const bw = bandwidthSummary([...data.nr_carriers, ...data.lte_carriers])
+  const nrBw = bandwidthSummary(data.nr_carriers)
+  const lteBw = bandwidthSummary(data.lte_carriers)
+  const serving = servingView(data)
+  const bars = barsText(data.signal_bars)
+  const activeParts = [
+    hasNR && `${nr.active} NR active${nr.idle ? `, ${nr.idle} idle` : ''}`,
+    hasLTE && `${lte.active} LTE active${lte.idle ? `, ${lte.idle} idle` : ''}`,
+  ].filter(Boolean)
 
   return (
     <div className="space-y-3">
@@ -243,36 +220,53 @@ export default function Overview() {
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
           <div>
             <p className="label">Connection</p>
-            <p className="mt-0.5 text-sm font-bold text-ink">{data.type ?? '\u2014'}</p>
+            <p className="mt-0.5 text-sm font-bold text-ink">{data.type ?? '—'}</p>
           </div>
           <div>
-            <p className="label">Provider</p>
-            <p className="mt-0.5 text-sm font-medium text-ink">{data.carrier ?? '\u2014'}</p>
-          </div>
-          <div>
-            <p className="label">Cell ID</p>
-            <p className="tnum mt-0.5 font-mono text-body text-ink2">{data.cell_id ?? '\u2014'}</p>
-          </div>
-          <div>
-            <p className="label">Carriers</p>
-            <p className="mt-0.5 text-sm text-ink2">
-              {hasNR ? `${data.nr_carriers.length} NR` : ''}
-              {hasNR && hasLTE ? ' + ' : ''}
-              {hasLTE ? `${data.lte_carriers.length} LTE` : ''}
-              {!hasNR && !hasLTE ? '\u2014' : ''}
+            <p className="label">Serving cell</p>
+            <p data-testid="serving-cell" className="mt-0.5 text-sm font-bold text-ink">
+              {serving.label ?? <span className="text-ink3"><Unavailable label="No serving carrier reported" /></span>}
             </p>
           </div>
           <div>
-            <p className="label">Bandwidth</p>
-            <p className="tnum font-mono mt-0.5 text-sm font-bold text-ink">{formatBandwidthMHz(totalBw)}</p>
+            <p className="label">Provider</p>
+            <p className="mt-0.5 text-sm font-medium text-ink">{data.carrier ?? '—'}</p>
+          </div>
+          <div>
+            <p className="label">Cell ID</p>
+            <p className="tnum mt-0.5 min-w-0 break-all font-mono text-body text-ink2">{data.cell_id ?? '—'}</p>
+          </div>
+          <div>
+            <p className="label">Carriers reported</p>
+            <p className="mt-0.5 text-sm text-ink2">
+              {hasNR ? `${nr.reported} NR` : ''}
+              {hasNR && hasLTE ? ' + ' : ''}
+              {hasLTE ? `${lte.reported} LTE` : ''}
+              {!hasNR && !hasLTE ? '—' : ''}
+            </p>
+            {activeParts.length > 0 && <p className="text-caption text-ink3">{activeParts.join(' · ')}</p>}
+          </div>
+          <div>
+            <p className="label">Reported bandwidth</p>
+            <p className="tnum font-mono mt-0.5 text-sm font-bold text-ink">{formatBandwidthMHz(bw.reportedMHz)}</p>
+            <p className="text-caption text-ink3">Sum of all reported carriers</p>
             {hasNR && hasLTE && (
               <p className="tnum font-mono text-caption text-ink3">
-                NR {formatBandwidthMHz(nrBw)} + LTE {formatBandwidthMHz(lteBw)}
+                NR {formatBandwidthMHz(nrBw.reportedMHz)} + LTE {formatBandwidthMHz(lteBw.reportedMHz)}
               </p>
+            )}
+            {bw.hasIdle && (
+              <p className="tnum font-mono text-caption text-ink3">Active only {formatBandwidthMHz(bw.activeMHz)}</p>
             )}
           </div>
           <div className="ml-auto">
-            <SignalBars bars={data.signal_bars} large />
+            {bars === null ? (
+              <p className="text-caption text-ink3">
+                Bars <Unavailable label="Signal bars unavailable" />
+              </p>
+            ) : (
+              <SignalBars bars={data.signal_bars} large />
+            )}
           </div>
         </div>
       </Card>
@@ -284,36 +278,7 @@ export default function Overview() {
         </Card>
       )}
 
-      <Card title="Signal quality reference">
-        <div className="grid grid-cols-1 gap-4 text-body md:grid-cols-3">
-          <div>
-            <p className="mb-1.5 font-semibold text-ink">RSRP (dBm)</p>
-            <div className="space-y-0.5 text-ink2">
-              <div className="flex justify-between"><span className="text-ok">Excellent</span><span className="tnum font-mono text-ink3">&gt; -80</span></div>
-              <div className="flex justify-between"><span className="text-ok">Good</span><span className="tnum font-mono text-ink3">-80 to -90</span></div>
-              <div className="flex justify-between"><span className="text-warn">Fair</span><span className="tnum font-mono text-ink3">-90 to -100</span></div>
-              <div className="flex justify-between"><span className="text-danger">Poor</span><span className="tnum font-mono text-ink3">&lt; -100</span></div>
-            </div>
-          </div>
-          <div>
-            <p className="mb-1.5 font-semibold text-ink">RSRQ (dB)</p>
-            <div className="space-y-0.5 text-ink2">
-              <div className="flex justify-between"><span className="text-ok">Good</span><span className="tnum font-mono text-ink3">&gt; -10</span></div>
-              <div className="flex justify-between"><span className="text-warn">Fair</span><span className="tnum font-mono text-ink3">-10 to -15</span></div>
-              <div className="flex justify-between"><span className="text-danger">Poor</span><span className="tnum font-mono text-ink3">&lt; -15</span></div>
-            </div>
-          </div>
-          <div>
-            <p className="mb-1.5 font-semibold text-ink">SINR (dB)</p>
-            <div className="space-y-0.5 text-ink2">
-              <div className="flex justify-between"><span className="text-ok">Excellent</span><span className="tnum font-mono text-ink3">&gt; 20</span></div>
-              <div className="flex justify-between"><span className="text-ok">Good</span><span className="tnum font-mono text-ink3">10 to 20</span></div>
-              <div className="flex justify-between"><span className="text-warn">Fair</span><span className="tnum font-mono text-ink3">0 to 10</span></div>
-              <div className="flex justify-between"><span className="text-danger">Poor</span><span className="tnum font-mono text-ink3">&lt; 0</span></div>
-            </div>
-          </div>
-        </div>
-      </Card>
+      <Legend />
     </div>
   )
 }

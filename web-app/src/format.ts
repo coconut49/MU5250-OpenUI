@@ -1,6 +1,11 @@
-// Formatting helpers and signal-quality thresholds.
+// Formatting helpers. Signal-quality thresholds live in ./data/signalQuality.
 
-export function formatBytes(bytes: number): string {
+import { LEVEL_LABEL, LEVEL_TONE, classifySignal, toneBgClass, toneTextClass } from './data/signalQuality'
+import type { SignalLevel } from './data/signalQuality'
+
+/** Unknown (null/undefined/non-finite/negative) renders as an em dash; a real 0 is "0 B". */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return '\u2014'
   if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`
   if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`
@@ -30,12 +35,18 @@ export function formatBandwidthMHz(mhz: number): string {
   return `${Number.isInteger(mhz) ? mhz.toFixed(0) : mhz.toFixed(1)} MHz`
 }
 
-export function formatUptime(secs?: number): string {
+export function formatUptime(secs?: number | null): string {
   if (!secs) return '\u2014'
   const d = Math.floor(secs / 86400)
   const h = Math.floor((secs % 86400) / 3600)
   const m = Math.floor((secs % 3600) / 60)
   return [d && `${d}d`, (d || h) && `${h}h`, `${m}m`].filter(Boolean).join(' ')
+}
+
+/** Usage-counter time: unknown is an em dash, a measured 0 is "0m". */
+export function formatCounterTime(secs?: number | null): string {
+  if (secs == null || !Number.isFinite(secs) || secs < 0) return '\u2014'
+  return secs === 0 ? '0m' : formatUptime(secs)
 }
 
 export function formatDuration(secs: number): string {
@@ -49,78 +60,47 @@ export function formatDuration(secs: number): string {
 }
 
 // ── Signal quality ────────────────────────────────────────────────────────────
+// Thresholds, labels and tones live in ./data/signalQuality (one policy table);
+// these helpers only adapt it to the class-name shapes the UI already uses.
 
-export type Quality = 'excellent' | 'good' | 'fair' | 'poor' | 'unknown'
+export type Quality = SignalLevel
 
-export function rsrpQuality(rsrp?: number): Quality {
-  if (rsrp == null) return 'unknown'
-  if (rsrp > -80) return 'excellent'
-  if (rsrp > -90) return 'good'
-  if (rsrp > -100) return 'fair'
-  return 'poor'
+export function rsrpQuality(rsrp?: number | null): Quality {
+  return classifySignal('rsrp', rsrp).level
+}
+
+export function rsrqQuality(rsrq?: number | null): Quality {
+  return classifySignal('rsrq', rsrq).level
+}
+
+export function sinrQuality(sinr?: number | null): Quality {
+  return classifySignal('sinr', sinr).level
 }
 
 export function qualityLabel(q: Quality): string {
-  switch (q) {
-    case 'excellent':
-      return 'Excellent'
-    case 'good':
-      return 'Good'
-    case 'fair':
-      return 'Fair'
-    case 'poor':
-      return 'Weak'
-    default:
-      return '\u2014'
-  }
+  return LEVEL_LABEL[q]
 }
 
 /** Tailwind text color class for a quality level. */
 export function qualityText(q: Quality): string {
-  switch (q) {
-    case 'excellent':
-    case 'good':
-      return 'text-ok'
-    case 'fair':
-      return 'text-warn'
-    case 'poor':
-      return 'text-danger'
-    default:
-      return 'text-ink3'
-  }
+  return toneTextClass(LEVEL_TONE[q])
 }
 
 /** Tailwind bg class for status dots / bars. */
 export function qualityBg(q: Quality): string {
-  switch (q) {
-    case 'excellent':
-    case 'good':
-      return 'bg-ok'
-    case 'fair':
-      return 'bg-warn'
-    case 'poor':
-      return 'bg-danger'
-    default:
-      return 'bg-ink3'
-  }
+  return toneBgClass(LEVEL_TONE[q])
 }
 
-export function rsrpColorClass(rsrp?: number): string {
-  return qualityText(rsrpQuality(rsrp))
+export function rsrpColorClass(rsrp?: number | null): string {
+  return toneTextClass(classifySignal('rsrp', rsrp).tone)
 }
 
-export function rsrqColorClass(v?: number): string {
-  if (v == null) return 'text-ink3'
-  if (v > -10) return 'text-ok'
-  if (v > -15) return 'text-warn'
-  return 'text-danger'
+export function rsrqColorClass(v?: number | null): string {
+  return toneTextClass(classifySignal('rsrq', v).tone)
 }
 
-export function sinrColorClass(v?: number): string {
-  if (v == null) return 'text-ink3'
-  if (v > 15) return 'text-ok'
-  if (v > 5) return 'text-warn'
-  return 'text-danger'
+export function sinrColorClass(v?: number | null): string {
+  return toneTextClass(classifySignal('sinr', v).tone)
 }
 
 export function tempColorClass(c?: number): string {

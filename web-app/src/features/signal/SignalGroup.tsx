@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Tabs } from '../../ui/Tabs'
+import { TabPanel, Tabs } from '../../ui/Tabs'
 import Overview from './Overview'
 import Locking from './Locking'
 
@@ -22,9 +22,13 @@ export default function SignalGroup() {
         ]}
         active={tab}
         onChange={setTab}
+        label="Signal sections"
+        idBase="signal"
       />
 
-      {tab === 'overview' ? <Overview /> : <Locking />}
+      <TabPanel idBase="signal" id={tab} className="space-y-4">
+        {tab === 'overview' ? <Overview /> : <Locking />}
+      </TabPanel>
     </div>
   )
 }

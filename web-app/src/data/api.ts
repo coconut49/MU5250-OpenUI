@@ -1,11 +1,19 @@
-import { readCsv } from './client'
 // Agent API bindings + response mappers.
 //
 // The mappers encode hard-won knowledge of the firmware's response shapes
 // (netinfo carrier strings, CA formats, band-lock bitmasks) — treat with care.
+// Validation lives at this boundary (see ./validate): a malformed field becomes
+// unknown/unavailable, never a fabricated 0 or a crash, and unknown extra
+// fields are ignored.
 
-import { get, post, put, req } from './client'
+import { get, post, put, readCsv, req } from './client'
+import { normaliseBands, parseLteBandLock, parseNrBandLock } from './bands'
+import { mapDataUsage } from './usage'
+import { boolLike, finiteNumber, intInRange, isObj, nonEmptyStr, nonNegative, nonNegativeInt, obj, str, strList, arr } from './validate'
+import { widthMhz } from './wifiWidth'
 import type {
+  ApnModeState,
+  ApnProfile,
   AtSendResult,
   BatteryBspInfo,
   BatteryDetail,
@@ -14,7 +22,6 @@ import type {
   ChargeControlState,
   Client,
   CpuInfo,
-  DataUsage,
   DeviceInfo,
   DnsConfig,
   HomeData,
@@ -23,6 +30,7 @@ import type {
   LoggerStatus,
   MemInfo,
   ModemCapabilities,
+  PrimaryCarrier,
   ProcessListResult,
   SignalInfo,
   SimInfo,
@@ -32,13 +40,16 @@ import type {
   ThermalAll,
   ThermalInfo,
   TtlStatus,
-  UsagePeriod,
   UsbMode,
+  UsbModeCapability,
+  UsbModeResult,
   UsbStatus,
   Wan6Info,
   WanInfo,
   WifiAll,
 } from '../types'
+
+export { mapDataUsage }
 
 // ── EARFCN / NR-ARFCN to frequency ──────────────────────────────────────────
 
@@ -90,15 +101,12 @@ function nrarfcnToFreq(arfcn: number): number | undefined {
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
-function parseNum(v: unknown): number | undefined {
-  if (typeof v === 'number') return v
-  if (typeof v === 'string') {
-    const t = v.trim()
-    if (!t || t === '--' || t === 'N/A') return undefined
-    const n = parseFloat(t)
-    return isNaN(n) ? undefined : n
-  }
-  return undefined
+/** Finite number from a number or strictly numeric string; '', '--', 'N/A', junk -> undefined. */
+const parseNum = finiteNumber
+
+function parseInteger(v: unknown): number | undefined {
+  const n = finiteNumber(v)
+  return n !== undefined && Number.isInteger(n) ? n : undefined
 }
 
 function parseCellId(id?: unknown): number | undefined {
@@ -126,33 +134,52 @@ function formatNci(id?: unknown): string | undefined {
   return nci == null ? undefined : nci.toString(16).toUpperCase()
 }
 
+/** Valid physical cell IDs: LTE 0–503, NR 0–1007. 0 is valid; absent/garbage is undefined. */
+const lteSignalPci = (v: unknown) => intInRange(v, 0, 503)
+const nrSignalPci = (v: unknown) => intInRange(v, 0, 1007)
+
+/** RSRP is a negative dBm value; 0 (or positive) is the firmware's "no measurement" placeholder. */
+function validRsrp(v: unknown): number | undefined {
+  const n = parseNum(v)
+  return n !== undefined && n < 0 ? n : undefined
+}
+
+/** RSSI likewise reports 0 when unmeasured. */
+function validRssi(v: unknown): number | undefined {
+  const n = parseNum(v)
+  return n !== undefined && n < 0 ? n : undefined
+}
+
 /** Parse lteca entries, returning SCCs only (excluding PCC by PCI+EARFCN match). */
 function parseLteCa(ltecaStr: string, pccPci?: number, pccEarfcn?: number) {
-  const sccs: { pci: string; band: string; earfcn: string; bw: string }[] = []
+  const sccs: { pci?: number; band: string; earfcn: number; bw: string }[] = []
   let pccFound = false
   for (const seg of ltecaStr.split(';')) {
     if (!seg.trim()) continue
     const p = seg.split(',')
     if (p.length < 5) continue
-    const entryPci = parseInt(p[0]) || 0
-    const entryEarfcn = parseInt(p[3]) || 0
-    if (!pccFound && entryPci === pccPci && entryEarfcn === pccEarfcn) {
+    const entryPci = parseInteger(p[0])
+    const entryEarfcn = parseInteger(p[3])
+    if (
+      !pccFound && pccPci !== undefined && pccEarfcn !== undefined &&
+      entryPci === pccPci && entryEarfcn === pccEarfcn
+    ) {
       pccFound = true
       continue
     }
-    sccs.push({ pci: p[0], band: p[1], earfcn: p[3], bw: p[4] })
+    sccs.push({ pci: entryPci === undefined ? undefined : lteSignalPci(entryPci), band: p[1].trim(), earfcn: entryEarfcn ?? 0, bw: p[4].trim() })
   }
   return sccs
 }
 
 /** Extract PCC bandwidth from lteca string. */
 function extractPccBw(ltecaStr: string | undefined, pccPci?: number, pccEarfcn?: number): string | undefined {
-  if (!ltecaStr) return undefined
+  if (!ltecaStr || pccPci === undefined || pccEarfcn === undefined) return undefined
   for (const seg of ltecaStr.split(';')) {
     if (!seg.trim()) continue
     const p = seg.split(',')
     if (p.length < 5) continue
-    if ((parseInt(p[0]) || 0) === pccPci && (parseInt(p[3]) || 0) === pccEarfcn) return p[4]
+    if (parseInteger(p[0]) === pccPci && parseInteger(p[3]) === pccEarfcn) return p[4].trim()
   }
   return undefined
 }
@@ -181,38 +208,76 @@ function parseCaSig(sigStr: string) {
 /** Lowest reportable NR RSRP; the modem reports it for unmeasured carriers. */
 const NR_RSRP_FLOOR = -140
 
+type NetworkMode = 'sa' | 'nsa' | 'lte' | 'unknown'
+
+/** Classify the firmware `network_type` string. Bare "5G"/"NR" is ambiguous -> unknown. */
+export function classifyNetworkType(type: unknown): NetworkMode {
+  const t = (typeof type === 'string' ? type : '').trim().toUpperCase()
+  if (!t) return 'unknown'
+  if (t.includes('ENDC') || t.includes('EN-DC') || t.includes('NSA')) return 'nsa'
+  if (/\bSA\b/.test(t)) return 'sa'
+  if (t === '4G' || t.includes('LTE')) return 'lte'
+  return 'unknown'
+}
+
+/**
+ * Choose the serving carrier from *validated* carriers by network mode.
+ * SA -> NR PCC. LTE -> LTE PCC. NSA/ENDC -> the LTE anchor PCC (UEs camp on the
+ * LTE anchor; the NR leg is secondary-cell-group and stays in nr_carriers).
+ * Unrecognised type -> only when exactly one RAT has a valid PCC.
+ * No fallback across RATs in a known mode: SA never picks LTE, even though the
+ * firmware leaves LTE fields populated there.
+ */
+function pickPrimary(mode: NetworkMode, lte: CarrierComponent[], nr: CarrierComponent[]): PrimaryCarrier | undefined {
+  const lteP = lte.find((c) => c.label === 'PCC')
+  const nrP = nr.find((c) => c.label === 'PCC')
+  const pick = (rat: 'lte' | 'nr', carrier: CarrierComponent | undefined): PrimaryCarrier | undefined =>
+    carrier ? { rat, carrier } : undefined
+  switch (mode) {
+    case 'sa':
+      return pick('nr', nrP)
+    case 'lte':
+    case 'nsa':
+      return pick('lte', lteP)
+    default:
+      if (lteP && !nrP) return pick('lte', lteP)
+      if (nrP && !lteP) return pick('nr', nrP)
+      return undefined
+  }
+}
+
 export function mapSignal(d: Record<string, unknown>): SignalInfo {
-  const pccPci = d.lte_pci as number | undefined
-  const pccEarfcn = d.wan_active_channel as number | undefined
-  const pccBandStr = (d.wan_active_band as string) ?? ''
+  const pccPci = lteSignalPci(d.lte_pci)
+  const pccEarfcn = nonNegativeInt(d.wan_active_channel)
+  const pccBandStr = str(d.wan_active_band) ?? ''
   const pccBandNum = parseInt(pccBandStr.replace(/\D/g, '')) || 0
-  const pccBw = extractPccBw(d.lteca as string | undefined, pccPci, pccEarfcn)
-  const snr = d.lte_snr as string | undefined
+  const ltecaStr = str(d.lteca) ?? ''
+  const pccBw = extractPccBw(ltecaStr, pccPci, pccEarfcn)
 
-  // Build LTE PCC — skip ghost carriers (e.g. in 5G SA mode)
+  // Build LTE PCC — skip ghost carriers (e.g. in 5G SA mode, where the active
+  // band is an NR band like "n78" and the LTE fields hold stale values).
   const lteCarriers: CarrierComponent[] = []
-  const lteRsrp = parseNum(d.lte_rsrp)
   const lteHasValidData =
-    pccBandStr && pccBandStr !== '0' && pccBandStr !== 'B' && pccBandStr !== 'B0' && pccEarfcn != null && pccEarfcn > 0
+    pccBandStr !== '' && pccBandStr !== '0' && pccBandStr !== 'B' && pccBandStr !== 'B0' &&
+    !/^n/i.test(pccBandStr) && pccEarfcn !== undefined && pccEarfcn > 0
 
-  if (lteRsrp != null && lteHasValidData) {
+  if (lteHasValidData && pccEarfcn !== undefined) {
     lteCarriers.push({
       label: 'PCC',
       band: pccBandNum ? `B${pccBandNum}` : pccBandStr,
-      pci: pccPci ?? 0,
+      pci: pccPci,
       earfcn: pccEarfcn,
       bandwidth: pccBw ? `${pccBw} MHz` : '—',
       freq: pccBandNum ? earfcnToFreq(pccEarfcn, pccBandNum) : undefined,
-      rsrp: lteRsrp,
+      rsrp: validRsrp(d.lte_rsrp),
       rsrq: parseNum(d.lte_rsrq),
-      sinr: snr ? parseFloat(snr) : undefined,
-      rssi: parseNum(d.lte_rssi),
+      sinr: parseNum(d.lte_snr),
+      rssi: validRssi(d.lte_rssi),
       ul_configured: true,
       active: true,
     })
 
-    const ltecaStr = (d.lteca as string) ?? ''
-    const ltecasigStr = (d.ltecasig as string) ?? ''
+    const ltecasigStr = str(d.ltecasig) ?? ''
     const ltecaEntries = parseLteCa(ltecaStr, pccPci, pccEarfcn)
     const ltecaSigs = parseCaSig(ltecasigStr)
 
@@ -223,10 +288,10 @@ export function mapSignal(d: Record<string, unknown>): SignalInfo {
       lteCarriers.push({
         label: `SCC${i}`,
         band: `B${e.band}`,
-        pci: parseInt(e.pci) || 0,
-        earfcn: parseInt(e.earfcn) || 0,
+        pci: e.pci,
+        earfcn: e.earfcn,
         bandwidth: `${e.bw} MHz`,
-        freq: bandNum ? earfcnToFreq(parseInt(e.earfcn) || 0, bandNum) : undefined,
+        freq: bandNum ? earfcnToFreq(e.earfcn, bandNum) : undefined,
         rsrp: sig?.rsrp === 0 ? undefined : sig?.rsrp,
         rsrq: sig?.rsrq === 0 ? undefined : sig?.rsrq,
         sinr: sig?.sinr,
@@ -239,40 +304,38 @@ export function mapSignal(d: Record<string, unknown>): SignalInfo {
 
   // Build NR primary — skip ghost carriers (no valid band or ARFCN, e.g. 4G-only)
   const nrCarriers: CarrierComponent[] = []
-  const nrRsrp = parseNum(d.nr5g_rsrp)
-  const nrBand = (d.nr5g_action_band as string) ?? ''
-  const nrArfcn = (d.nr5g_action_channel as number) ?? 0
-  const nrHasValidData = nrBand && nrBand !== '0' && nrBand !== 'n' && nrBand !== 'n0' && nrArfcn > 0
-  if (nrRsrp != null && nrHasValidData) {
-    const nrBwRaw = (d.nr5g_bandwidth as string) ?? ''
+  const nrBand = str(d.nr5g_action_band) ?? ''
+  const nrArfcn = nonNegativeInt(d.nr5g_action_channel) ?? 0
+  const nrHasValidData = nrBand !== '' && nrBand !== '0' && nrBand !== 'n' && nrBand !== 'n0' && nrArfcn > 0
+  if (nrHasValidData) {
+    const nrBw = parseNum(d.nr5g_bandwidth)
+    const nrPccPci = nrSignalPci(d.nr5g_pci)
     nrCarriers.push({
       label: 'PCC',
       band: nrBand.startsWith('n') ? nrBand : `n${nrBand}`,
-      pci: (d.nr5g_pci as number) ?? 0,
+      pci: nrPccPci,
       earfcn: nrArfcn,
-      bandwidth: nrBwRaw ? `${nrBwRaw} MHz` : '—',
-      freq: nrArfcn ? nrarfcnToFreq(nrArfcn) : undefined,
-      rsrp: nrRsrp,
+      bandwidth: nrBw !== undefined ? `${nrBw} MHz` : '—',
+      freq: nrarfcnToFreq(nrArfcn),
+      rsrp: validRsrp(d.nr5g_rsrp),
       rsrq: parseNum(d.nr5g_rsrq),
       sinr: parseNum(d.nr5g_snr),
-      rssi: parseNum(d.nr5g_rssi),
+      rssi: validRssi(d.nr5g_rssi),
       ul_configured: true,
       active: true,
     })
 
     // nrca SCCs — format: index,pci,?,band,arfcn,bw,...,rsrp,rsrq,sinr,rssi
-    const nrcaStr = (d.nrca as string) ?? ''
-    const nrPccPci = d.nr5g_pci as number | undefined
-    const nrPccArfcn = nrArfcn
+    const nrcaStr = str(d.nrca) ?? ''
     for (const seg of nrcaStr.split(';')) {
       if (!seg.trim()) continue
       const parts = seg.split(',')
       if (parts.length < 6) continue
-      const sPci = parseInt(parts[1]) || 0
-      const sArfcn = parseInt(parts[4]) || 0
-      if (sPci === nrPccPci && sArfcn === nrPccArfcn) continue
-      const sBand = parseInt(parts[3]) || 0
-      const sBw = parts[5]
+      const sPci = nrSignalPci(parts[1])
+      const sArfcn = parseInteger(parts[4]) ?? 0
+      if (sPci !== undefined && nrPccPci !== undefined && sPci === nrPccPci && sArfcn === nrArfcn) continue
+      const sBand = parseInteger(parts[3]) ?? 0
+      const sBw = parts[5].trim()
       // A configured-but-unmeasured SCC reports the 3GPP reporting floors
       // (RSRP -140, RSRQ -43, SINR -23): no measurement, not a real reading.
       const sRsrp = parts.length >= 8 ? parseNum(parts[7]) : undefined
@@ -294,54 +357,33 @@ export function mapSignal(d: Record<string, unknown>): SignalInfo {
     }
   }
 
-  // Parse current band locks from device
-  let lte_band_lock: number[] | undefined
-  const lteLockStr = d.lte_band_lock as string | undefined
-  if (lteLockStr && lteLockStr !== '0') {
-    try {
-      const mask = BigInt(lteLockStr)
-      const bands: number[] = []
-      for (let b = 1; b <= 71; b++) {
-        if ((mask >> BigInt(b - 1)) & BigInt(1)) bands.push(b)
-      }
-      if (bands.length > 0) lte_band_lock = bands
-    } catch {
-      /* ignore parse errors */
-    }
-  }
-
-  let nr_band_lock: number[] | undefined
-  const nrSaStr = (d.nr5g_sa_band_lock as string) ?? ''
-  const nrNsaStr = (d.nr5g_nsa_band_lock as string) ?? ''
-  const nrLockStr = nrSaStr || nrNsaStr
-  if (nrLockStr) {
-    const bands = nrLockStr
-      .split(',')
-      .map((s) => parseInt(s.trim()))
-      .filter((n) => n > 0)
-    if (bands.length > 0) nr_band_lock = bands
-  }
-
-  const netType = d.network_type as string | undefined
-  const is4g = netType === '4G' || netType === 'LTE' || netType === 'NSA' || netType === 'ENDC'
+  const mode = classifyNetworkType(d.network_type)
   // NSA/ENDC camps on the LTE anchor, so its LTE cell is the serving cell.
+  const is4g = mode === 'lte' || mode === 'nsa'
   const cellId = is4g && parseCellId(d.cell_id) != null
     ? formatEci(d.cell_id)
     : formatNci(d.nr5g_cell_id) ?? formatEci(d.cell_id)
 
+  // SA and NSA locks are separate observations; never substitute one for the other.
+  const rawSa = d.nr5g_sa_band_lock
+  const rawNsa = d.nr5g_nsa_band_lock
+
   return {
-    type: netType,
-    carrier: (d.network_provider_fullname || d.network_provider) as string | undefined,
-    signal_bars: d.signalbar ? parseInt(d.signalbar as string) : undefined,
+    type: str(d.network_type),
+    carrier: nonEmptyStr(d.network_provider_fullname) ?? nonEmptyStr(d.network_provider),
+    signal_bars: intInRange(d.signalbar, 0, 5),
     cell_id: cellId,
     lte_carriers: lteCarriers,
     nr_carriers: nrCarriers,
-    net_select: d.net_select as string | undefined,
-    lte_band_lock,
-    nr_band_lock,
+    primary: pickPrimary(mode, lteCarriers, nrCarriers),
+    net_select: str(d.net_select),
+    lte_band_lock_state: parseLteBandLock(d.lte_band_lock),
+    nr_sa_band_lock_state: parseNrBandLock(rawSa),
+    nr_nsa_band_lock_state: parseNrBandLock(rawNsa),
     raw_lte_band_lock: String(d.lte_band_lock ?? ''),
-    raw_nr_band_lock: `SA=${String(d.nr5g_sa_band_lock ?? '')} NSA=${String(d.nr5g_nsa_band_lock ?? '')}`,
-    rsrp: parseNum(d.lte_rsrp) ?? parseNum(d.nr5g_rsrp),
+    raw_nr_band_lock: `SA=${String(rawSa ?? '')} NSA=${String(rawNsa ?? '')}`,
+    raw_nr_sa_band_lock: str(rawSa),
+    raw_nr_nsa_band_lock: str(rawNsa),
     band: pccBandStr,
   }
 }
@@ -449,17 +491,8 @@ function mapMemory(d: Record<string, unknown>): MemInfo {
   }
 }
 
-function mapWifi(d: Record<string, unknown>): WifiAll {
-  const parseBoolLike = (value: unknown, fallback: boolean): boolean => {
-    if (typeof value === 'boolean') return value
-    if (typeof value === 'number') return value !== 0
-    if (typeof value === 'string') {
-      const normalized = value.trim().toLowerCase()
-      if (['1', 'true', 'on', 'yes', 'enabled'].includes(normalized)) return true
-      if (['0', 'false', 'off', 'no', 'disabled'].includes(normalized)) return false
-    }
-    return fallback
-  }
+export function mapWifi(d: Record<string, unknown>): WifiAll {
+  const parseBoolLike = (value: unknown, fallback: boolean): boolean => boolLike(value) ?? fallback
   const parseChannelNumber = (value: unknown): number | undefined => {
     const raw = String(value ?? '')
     const n = parseInt(raw, 10)
@@ -473,8 +506,8 @@ function mapWifi(d: Record<string, unknown>): WifiAll {
   const configuredChannel5g = String(d.channel_5g ?? 'auto') || 'auto'
   const actualChannel2g = parseChannelNumber(d.actual_channel_2g)
   const actualChannel5g = parseChannelNumber(d.actual_channel_5g)
-  const actualBw2g = d.actual_bw_2g as string | undefined
-  const actualBw5g = d.actual_bw_5g as string | undefined
+  const actualBw2g = str(d.actual_bw_2g)
+  const actualBw5g = str(d.actual_bw_5g)
   return {
     band_2g: {
       ssid: d.ssid_2g as string | undefined,
@@ -482,7 +515,10 @@ function mapWifi(d: Record<string, unknown>): WifiAll {
       channel: actualChannel2g,
       bandwidth: actualBw2g,
       configuredChannel: configuredChannel2g === '0' ? 'auto' : configuredChannel2g,
-      configuredBandwidth: d.htmode_2g as string | undefined,
+      configuredBandwidth: str(d.htmode_2g),
+      configuredWidthMhz: widthMhz(d.htmode_2g),
+      actualWidthMhz: widthMhz(actualBw2g),
+      txpowerPercent: intInRange(d.txpower_2g, 1, 100),
       bandwidthOptions: d.bandwidth_options_2g as string[] | undefined,
       supportedStandards: d.supported_standards_2g as string | undefined,
       actualChannel: actualChannel2g,
@@ -498,7 +534,10 @@ function mapWifi(d: Record<string, unknown>): WifiAll {
       channel: actualChannel5g,
       bandwidth: actualBw5g,
       configuredChannel: configuredChannel5g === '0' ? 'auto' : configuredChannel5g,
-      configuredBandwidth: d.htmode_5g as string | undefined,
+      configuredBandwidth: str(d.htmode_5g),
+      configuredWidthMhz: widthMhz(d.htmode_5g),
+      actualWidthMhz: widthMhz(actualBw5g),
+      txpowerPercent: intInRange(d.txpower_5g, 1, 100),
       bandwidthOptions: d.bandwidth_options_5g as string[] | undefined,
       supportedStandards: d.supported_standards_5g as string | undefined,
       actualChannel: actualChannel5g,
@@ -547,50 +586,53 @@ function mapSim(d: Record<string, unknown>): SimInfo {
   }
 }
 
-function mapDataUsage(d: Record<string, unknown>): DataUsage {
-  const p = (v: Record<string, unknown>): UsagePeriod => ({
-    rx_bytes: Number(v.rx_bytes ?? 0),
-    tx_bytes: Number(v.tx_bytes ?? 0),
-    time_secs: Number(v.time_secs ?? 0),
-  })
-  const cycle = d.cycle as Record<string, unknown> | undefined
-  const sincePowerOn = d.since_power_on as Record<string, unknown> | undefined
-  return {
-    day: p(d.day as Record<string, unknown>),
-    month: p(d.month as Record<string, unknown>),
-    cycle: cycle ? p(cycle) : undefined,
-    since_power_on: sincePowerOn ? p(sincePowerOn) : undefined,
-    total: p(d.total as Record<string, unknown>),
-    reset_day: d.reset_day != null ? Number(d.reset_day) : undefined,
-    reset_enabled: d.reset_enabled === true || Number(d.reset_enabled) === 1,
-    clear_date_record: d.clear_date_record as string | undefined,
-    next_clear_date: d.next_clear_date as string | undefined,
-  }
-}
-
 /**
  * Map the raw `zte_libwms_get_sms_data` response. The firmware returns
  * `{messages: [{id, number, content, date, tag, mem_store}, ...]}`; UCS-2
  * hex-encoded content/numbers are decoded.
+ *
+ * Entries without a valid id (never defaulted to 0), without a recognised tag
+ * (0–4), that are not objects, or that repeat an earlier id are dropped and
+ * counted so callers can flag them. A payload that is neither a list nor an
+ * object with a list/absent `messages` throws instead of reading as "empty".
  */
-function mapSmsList(d: unknown): SmsMessage[] {
-  const raw: Record<string, unknown>[] = Array.isArray(d)
-    ? (d as Record<string, unknown>[])
-    : isObj(d) && Array.isArray(d.messages)
-      ? (d.messages as Record<string, unknown>[])
-      : []
-  return raw.map((m) => {
-    const number = String(m.number ?? '')
-    const content = String(m.content ?? '')
-    return {
-      id: Number(m.id ?? 0),
+export function mapSmsListResult(d: unknown): { messages: SmsMessage[]; dropped: number } {
+  let raw: unknown[]
+  if (Array.isArray(d)) raw = d
+  else if (isObj(d)) {
+    if (d.messages == null) raw = []
+    else if (Array.isArray(d.messages)) raw = d.messages
+    else throw new Error('Malformed SMS list response')
+  } else throw new Error('Malformed SMS list response')
+
+  const messages: SmsMessage[] = []
+  const seen = new Set<number>()
+  let dropped = 0
+  const text = (v: unknown): string =>
+    typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : ''
+  for (const m of raw) {
+    if (!isObj(m)) { dropped++; continue }
+    const id = nonNegativeInt(m.id)
+    const tag = intInRange(m.tag, 0, 4)
+    if (id === undefined || tag === undefined || seen.has(id)) { dropped++; continue }
+    seen.add(id)
+    const number = text(m.number)
+    const content = text(m.content)
+    const date = text(m.date)
+    messages.push({
+      id,
       number: isUcs2Hex(number) ? decodeUcs2Hex(number) : number,
       content: isUcs2Hex(content) ? decodeUcs2Hex(content) : content,
-      date: m.date != null ? String(m.date) : undefined,
-      tag: Number(m.tag ?? 0),
-      mem_store: m.mem_store != null ? Number(m.mem_store) : undefined,
-    }
-  })
+      date: date !== '' ? date : undefined,
+      tag,
+      mem_store: nonNegativeInt(m.mem_store),
+    })
+  }
+  return { messages, dropped }
+}
+
+export function mapSmsList(d: unknown): SmsMessage[] {
+  return mapSmsListResult(d).messages
 }
 
 function isUcs2Hex(s: string): boolean {
@@ -624,10 +666,6 @@ function mapBatteryBspInfo(d: Record<string, unknown>): BatteryBspInfo {
   }
 }
 
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v)
-}
-
 /** Map the /api/dashboard batch response into the Home screen shape. */
 function mapHome(d: Record<string, unknown>): HomeData {
   return {
@@ -643,6 +681,211 @@ function mapHome(d: Record<string, unknown>): HomeData {
     thermal: isObj(d.thermal) ? mapThermal(d.thermal) : null,
     sources: isObj(d.sources) ? d.sources as unknown as HomeData['sources'] : {},
     charge_control_error: typeof d.charge_control_error === 'string' ? d.charge_control_error : null,
+  }
+}
+
+// ── USB ───────────────────────────────────────────────────────────────────────
+
+const USB_MODE_VALUES: readonly UsbMode[] = ['ecm', 'rndis', 'ncm']
+
+function parseUsbMode(v: unknown): UsbMode | null {
+  const t = typeof v === 'string' ? v.trim().toLowerCase() : ''
+  return USB_MODE_VALUES.find((m) => m === t) ?? null
+}
+
+function mapUsbCapabilities(v: unknown): UsbModeCapability[] | undefined {
+  const list = arr(v)
+  if (!list) return undefined
+  const out: UsbModeCapability[] = []
+  for (const entry of list) {
+    if (!isObj(entry)) continue
+    const mode = parseUsbMode(entry.mode)
+    const supported = boolLike(entry.supported)
+    // Never invent support: an entry we cannot read is simply absent.
+    if (mode === null || supported === undefined || out.some((c) => c.mode === mode)) continue
+    out.push({
+      mode,
+      supported,
+      // Missing flag: NCM is treated as experimental (requires confirmation), the safe default.
+      experimental: boolLike(entry.experimental) ?? mode === 'ncm',
+      function: str(entry.function),
+      note: str(entry.note),
+    })
+  }
+  return out
+}
+
+/**
+ * Map `GET /api/usb/status`. `mode_capabilities` stays authoritative: absent or
+ * unreadable -> undefined (callers apply a documented fallback); entries are
+ * never synthesised. Active mode, default mode and the NCM persistence flag are
+ * kept separate; unknown extra fields are ignored.
+ */
+export function mapUsbStatus(d: Record<string, unknown>): UsbStatus {
+  const link = obj(d.link)
+  const configfs = obj(d.configfs)
+  const bridge = obj(d.bridge)
+  const interfaces = obj(d.interfaces)
+  const usbIds = obj(d.usb_ids)
+  const defaultMode = parseUsbMode(d.default_mode)
+  return {
+    active_mode: parseUsbMode(d.active_mode),
+    default_mode: defaultMode ?? undefined,
+    link: link && {
+      negotiated: str(link.negotiated),
+      negotiated_label: str(link.negotiated_label),
+      negotiated_mbps: nonNegative(link.negotiated_mbps),
+      max: str(link.max),
+      max_label: str(link.max_label),
+      max_mbps: nonNegative(link.max_mbps),
+      at_full_speed: boolLike(link.at_full_speed),
+    },
+    ncm_persist_on_boot: boolLike(d.ncm_persist_on_boot),
+    supported_modes: strList(d.supported_modes) ?? [],
+    experimental_modes: strList(d.experimental_modes),
+    mode_capabilities: mapUsbCapabilities(d.mode_capabilities),
+    composition_functions: strList(d.composition_functions),
+    configfs: configfs && {
+      present: boolLike(configfs.present),
+      ncm: boolLike(configfs.ncm),
+      gsi_ecm: boolLike(configfs.gsi_ecm),
+      gsi_rndis: boolLike(configfs.gsi_rndis),
+    },
+    bridge: bridge && { name: str(bridge.name), members: strList(bridge.members) },
+    interfaces: interfaces && {
+      ecm0: boolLike(interfaces.ecm0),
+      rndis0: boolLike(interfaces.rndis0),
+      ncm0: boolLike(interfaces.ncm0),
+      ncm_ifname: str(interfaces.ncm_ifname) ?? null,
+    },
+    usb_ids: usbIds && { vendor: str(usbIds.vendor) ?? null, product: str(usbIds.product) ?? null },
+    ncm_last_error: str(d.ncm_last_error),
+    connect: finiteNumber(d.connect),
+    typec_cc: str(d.typec_cc),
+  }
+}
+
+/**
+ * Map the `PUT /api/usb/mode` answer: `status: "scheduled"` (NCM, ECM rollback
+ * from NCM; HTTP 202) vs anything else (ubus passthrough for ECM/RNDIS).
+ * A scheduled answer never throws, even with an unreadable mode: the switch
+ * has been accepted and the caller must go and verify it.
+ */
+export function mapUsbModeResult(d: Record<string, unknown>): UsbModeResult {
+  if (d.status === 'scheduled') {
+    const rollback = str(d.rollback)
+    return {
+      state: 'scheduled',
+      mode: parseUsbMode(d.mode),
+      experimental: boolLike(d.experimental) ?? false,
+      delayMs: nonNegative(d.delay_ms) ?? null,
+      ...(rollback !== undefined ? { rollback } : {}),
+    }
+  }
+  return { state: 'applied', raw: d }
+}
+
+// ── APN ───────────────────────────────────────────────────────────────────────
+
+/** `apn_mode`: 0 = automatic, 1 = manual. Missing or any other value is 'unknown', not automatic. */
+export function mapApnMode(d: Record<string, unknown>): ApnModeState {
+  const raw = d.apn_mode
+  const n = finiteNumber(raw)
+  return { mode: n === 0 ? 'auto' : n === 1 ? 'manual' : 'unknown', raw }
+}
+
+/**
+ * Map `apnListArray`. Missing/null list = no profiles; a non-array throws.
+ * Entries without a usable profileId (string or number) are dropped; the
+ * firmware's mixed number/string/boolean encodings are normalised here.
+ */
+export function mapApnProfiles(d: Record<string, unknown>): ApnProfile[] {
+  const list = d.apnListArray
+  if (list == null) return []
+  if (!Array.isArray(list)) throw new Error('Malformed APN profile list')
+  const out: ApnProfile[] = []
+  for (const p of list) {
+    if (!isObj(p)) continue
+    const profileId =
+      nonEmptyStr(p.profileId) !== undefined
+        ? (p.profileId as string).trim()
+        : typeof p.profileId === 'number' && Number.isFinite(p.profileId)
+          ? String(p.profileId)
+          : undefined
+    if (profileId === undefined || out.some((x) => x.profileId === profileId)) continue
+    out.push({
+      profilename: str(p.profilename) ?? '',
+      wanapn: str(p.wanapn) ?? '',
+      username: str(p.username) ?? '',
+      password: str(p.password) ?? '',
+      pdpType: intInRange(p.pdpType, 0, 255) ?? null,
+      pppAuthMode: intInRange(p.pppAuthMode, 0, 255) ?? null,
+      profileId,
+      isEnable: boolLike(p.isEnable) ?? false,
+    })
+  }
+  return out
+}
+
+// ── Capabilities / charge control / TTL ───────────────────────────────────────
+
+function bandList(v: unknown): number[] {
+  return normaliseBands((arr(v) ?? []).flatMap((x) => {
+    const n = finiteNumber(x)
+    return n === undefined ? [] : [n]
+  }))
+}
+
+/** Modem capabilities. Missing lists mean "no support claimed", never a guessed default. */
+export function mapModemCapabilities(d: Record<string, unknown>): ModemCapabilities {
+  const network_modes: ModemCapabilities['network_modes'] = []
+  for (const m of arr(d.network_modes) ?? []) {
+    if (!isObj(m)) continue
+    const value = nonEmptyStr(m.value)
+    if (value !== undefined) network_modes.push({ value, label: nonEmptyStr(m.label) ?? value })
+  }
+  return {
+    network_modes,
+    lte_bands: bandList(d.lte_bands),
+    nr_sa_bands: bandList(d.nr_sa_bands),
+    nr_nsa_band_lock_supported: boolLike(d.nr_nsa_band_lock_supported) ?? false,
+  }
+}
+
+/**
+ * Charge-control state. The limit/hysteresis/enabled fields drive the slider
+ * and toggle, so a payload where they are unreadable is rejected (callers see
+ * an error/unavailable state) rather than rendered with invented values.
+ * Availability flags default to false: unreadable never means available.
+ */
+export function mapChargeControl(d: Record<string, unknown>): ChargeControlState {
+  const charge_limit = intInRange(d.charge_limit, 0, 100)
+  const hysteresis = nonNegative(d.hysteresis)
+  const charge_limit_enabled = boolLike(d.charge_limit_enabled)
+  if (charge_limit === undefined || hysteresis === undefined || charge_limit_enabled === undefined) {
+    throw new Error('Malformed charge control response')
+  }
+  return {
+    last_error: str(d.last_error) ?? null,
+    available: boolLike(d.available) ?? false,
+    battery_available: boolLike(d.battery_available) ?? false,
+    charger_available: boolLike(d.charger_available) ?? false,
+    charging_stopped: boolLike(d.charging_stopped) ?? null,
+    battery_status: str(d.battery_status) ?? null,
+    capacity: intInRange(d.capacity, 0, 100) ?? null,
+    charge_limit_enabled,
+    charge_limit,
+    hysteresis,
+    manual_override: boolLike(d.manual_override) ?? false,
+  }
+}
+
+/** TTL status; unreadable fields are undefined (unknown), never "disabled". */
+export function mapTtlStatus(d: Record<string, unknown>): TtlStatus {
+  return {
+    active: boolLike(d.active),
+    ipv6_active: boolLike(d.ipv6_active),
+    ttl_value: intInRange(d.ttl_value, 0, 255),
   }
 }
 
@@ -666,7 +909,7 @@ export const api = {
   // Modem / SIM
   simInfo: () => get('/api/sim/info').then(mapSim),
   simImei: () => get('/api/sim/imei'),
-  modemCapabilities: () => get('/api/modem/capabilities').then((d) => d as unknown as ModemCapabilities),
+  modemCapabilities: () => get('/api/modem/capabilities').then(mapModemCapabilities),
   networkModeSet: (net_select: string) => put('/api/modem/network-mode', { net_select }),
 
   // WiFi
@@ -684,16 +927,16 @@ export const api = {
   batteryInfoUbus: () => get('/api/device/battery-info').then(mapBatteryBspInfo),
   batteryDetail: () => get('/api/device/battery/detail').then((d) => d as unknown as BatteryDetail),
   chargerInfo: () => get('/api/device/charger'),
-  chargeControl: () => get('/api/device/charge-control').then((d) => d as unknown as ChargeControlState),
+  chargeControl: () => get('/api/device/charge-control').then(mapChargeControl),
   // The agent answers the PUT with the full updated state (device_ext.rs ends
   // in charge_control_get), so re-fetching it would be a wasted round trip.
   chargeControlSet: (body: Partial<ChargeControlState>) =>
-    put('/api/device/charge-control', body).then((d) => d as unknown as ChargeControlState),
+    put('/api/device/charge-control', body).then(mapChargeControl),
 
   // APN
-  apnModeGet: () => get('/api/router/apn/mode'),
+  apnModeGet: () => get('/api/router/apn/mode').then(mapApnMode),
   apnModeSet: (body: Record<string, unknown>) => put('/api/router/apn/mode', body),
-  apnProfiles: () => get('/api/router/apn/profiles'),
+  apnProfiles: () => get('/api/router/apn/profiles').then(mapApnProfiles),
   apnAdd: (body: Record<string, unknown>) => post('/api/router/apn/profiles', body),
   apnDelete: (body: Record<string, unknown>) => post('/api/router/apn/profiles/delete', body),
   apnActivate: (body: Record<string, unknown>) => post('/api/router/apn/profiles/activate', body),
@@ -701,6 +944,8 @@ export const api = {
   // SMS: the agent owns translation to ZTE's legacy WMS payloads.
   smsCapabilities: () => get('/api/sms/capabilities').then((d) => d as unknown as SmsCapabilities),
   smsList: () => post('/api/sms/list', { page: 0, per_page: 500 }).then(mapSmsList),
+  /** Same request, also reporting how many malformed/duplicate entries were dropped. */
+  smsListChecked: () => post('/api/sms/list', { page: 0, per_page: 500 }).then(mapSmsListResult),
   smsSend: (number: string, message: string) => post('/api/sms/send', { number, message }),
   smsDelete: (ids: number[]) => post('/api/sms/delete', { ids }),
   smsRead: (ids: number[]) => post('/api/sms/read', { ids }),
@@ -715,14 +960,14 @@ export const api = {
 
   // USB
   usbMode: (mode: string, options?: { confirm_experimental?: boolean }) =>
-    put('/api/usb/mode', { mode, ...(options ?? {}) }),
+    put('/api/usb/mode', { mode, ...(options ?? {}) }).then(mapUsbModeResult),
   usbDefaultMode: (mode: UsbMode, options?: { confirm_experimental?: boolean }) =>
     put('/api/usb/default', { mode, ...(options ?? {}) }),
-  usbStatus: () => get('/api/usb/status').then((d) => d as unknown as UsbStatus),
+  usbStatus: () => get('/api/usb/status').then(mapUsbStatus),
   usbPowerbank: (on: boolean) => put('/api/usb/powerbank', { state: on ? 1 : 0 }),
 
   // TTL
-  ttlStatus: () => get('/api/ttl/status').then((d) => d as unknown as TtlStatus),
+  ttlStatus: () => get('/api/ttl/status').then(mapTtlStatus),
   ttlSet: (ttl: number) => put('/api/ttl/set', { ttl }),
   ttlClear: () => req('DELETE', '/api/ttl/clear'),
 

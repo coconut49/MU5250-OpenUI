@@ -1,5 +1,6 @@
 import { lazy, useEffect, useState } from 'react'
 import { AUTH_EXPIRED_EVENT, clearToken, hasToken } from './data/client'
+import { clearPollCache } from './data/poll'
 import { HomeProvider } from './app/HomeContext'
 import Login from './app/Login'
 import Shell, { type Group } from './app/Shell'
@@ -18,7 +19,10 @@ export default function App() {
   const { theme, toggle } = useTheme()
 
   useEffect(() => {
-    const onAuthExpired = () => setAuthed(false)
+    const onAuthExpired = () => {
+      clearPollCache()
+      setAuthed(false)
+    }
     window.addEventListener(AUTH_EXPIRED_EVENT, onAuthExpired)
     return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onAuthExpired)
   }, [])
@@ -44,6 +48,7 @@ export default function App() {
             <SystemGroup
               onLogout={() => {
                 clearToken()
+                clearPollCache()
                 setAuthed(false)
               }}
             />
